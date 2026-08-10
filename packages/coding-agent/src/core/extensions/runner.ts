@@ -291,6 +291,7 @@ export class ExtensionRunner {
 	private navigateTreeHandler: NavigateTreeHandler = async () => ({ cancelled: false });
 	private switchSessionHandler: SwitchSessionHandler = async () => ({ cancelled: false });
 	private reloadHandler: ReloadHandler = async () => {};
+	private directReloadHandler: () => Promise<void> = async () => {};
 	private shutdownHandler: ShutdownHandler = () => {};
 	private shortcutDiagnostics: ResourceDiagnostic[] = [];
 	private commandDiagnostics: ResourceDiagnostic[] = [];
@@ -433,6 +434,16 @@ export class ExtensionRunner {
 	setUIContext(uiContext?: ExtensionUIContext, mode: ExtensionMode = "print"): void {
 		this.uiContext = uiContext ?? noOpUIContext;
 		this.mode = mode;
+	}
+
+	/**
+	 * Bind a reload implementation that runs directly (no TUI streaming guard,
+	 * no UI). Used by ExtensionContext.reload() so tools/events can hot-reload
+	 * the extension runtime mid-turn without ending the agent loop or injecting
+	 * a resume message into the transcript.
+	 */
+	bindDirectReload(handler: () => Promise<void>): void {
+		this.directReloadHandler = handler;
 	}
 
 	getUIContext(): ExtensionUIContext {
@@ -746,6 +757,10 @@ export class ExtensionRunner {
 			getSystemPrompt: () => {
 				runner.assertActive();
 				return runner.getSystemPromptFn();
+			},
+			reload: () => {
+				runner.assertActive();
+				return runner.directReloadHandler();
 			},
 		};
 	}

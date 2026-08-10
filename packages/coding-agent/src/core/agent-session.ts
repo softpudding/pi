@@ -2319,6 +2319,9 @@ export class AgentSession {
 	private _applyExtensionBindings(runner: ExtensionRunner): void {
 		runner.setUIContext(this._extensionUIContext, this._extensionMode);
 		runner.bindCommandContext(this._extensionCommandContextActions);
+		// tool/event contexts get a direct reload: hot-reload the extension runtime
+		// mid-turn without the TUI streaming guard and without ending the agent loop
+		runner.bindDirectReload(() => this.reload());
 
 		this._extensionErrorUnsubscriber?.();
 		this._extensionErrorUnsubscriber = this._extensionErrorListener

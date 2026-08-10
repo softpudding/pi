@@ -344,6 +344,14 @@ export interface ExtensionContext {
 	compact(options?: CompactOptions): void;
 	/** Get the current effective system prompt. */
 	getSystemPrompt(): string;
+
+	/**
+	 * Hot-reload the extension runtime (extensions, skills, prompts, themes,
+	 * context files). Available in all contexts including tools/events: runs
+	 * directly without the TUI streaming guard and does NOT end the agent loop,
+	 * so a tool can reload and keep going in the same turn.
+	 */
+	reload?(): Promise<void>;
 }
 
 /**
