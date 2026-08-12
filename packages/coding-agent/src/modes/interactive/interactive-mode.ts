@@ -1870,6 +1870,7 @@ export class InteractiveMode {
 				reload: async () => {
 					await this.handleReloadCommand();
 				},
+				sendUserMessage: (content, options) => this.session.sendUserMessage(content, options),
 			},
 			shutdownHandler: () => {
 				this.shutdownRequested = true;

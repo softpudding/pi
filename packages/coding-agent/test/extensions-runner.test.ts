@@ -934,6 +934,7 @@ describe("ExtensionRunner", () => {
 				navigateTree: async () => ({ cancelled: false }),
 				switchSession: async () => ({ cancelled: false }),
 				reload: async () => {},
+				sendUserMessage: async () => {},
 			});
 
 			const commandContext = runner.createCommandContext();

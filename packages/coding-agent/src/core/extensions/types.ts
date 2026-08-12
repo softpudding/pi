@@ -392,6 +392,13 @@ export interface ExtensionCommandContext extends ExtensionContext {
 
 	/** Reload extensions, skills, prompts, themes, and context files. */
 	reload(): Promise<void>;
+
+	/** Inject a user message into the transcript (deliverAs: "steer" | "followUp").
+	 *  Lets command handlers kick off an agent turn (e.g. run a workflow). */
+	sendUserMessage(
+		content: string | (TextContent | ImageContent)[],
+		options?: { deliverAs?: "steer" | "followUp" },
+	): Promise<void>;
 }
 
 /**
@@ -1691,6 +1698,7 @@ export interface ExtensionCommandContextActions {
 		options?: { withSession?: (ctx: ReplacedSessionContext) => Promise<void> },
 	) => Promise<{ cancelled: boolean }>;
 	reload: () => Promise<void>;
+	sendUserMessage: SendUserMessageHandler;
 }
 
 /**

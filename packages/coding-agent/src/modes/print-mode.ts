@@ -97,6 +97,7 @@ export async function runPrintMode(runtimeHost: AgentSessionRuntime, options: Pr
 				reload: async () => {
 					await session.reload();
 				},
+				sendUserMessage: (content, options) => session.sendUserMessage(content, options),
 			},
 			onError: (err) => {
 				console.error(`Extension error (${err.extensionPath}): ${err.error}`);
