@@ -1885,6 +1885,17 @@ export class InteractiveMode {
 		setRegisteredThemes(this.session.resourceLoader.getThemes().themes);
 		this.setupAutocompleteProvider();
 
+		// Direct (mid-turn) reloads from extension tools rebuild the extension
+		// runner but not the TUI's command autocomplete/shortcuts — re-sync them
+		// whenever any reload() completes so newly registered commands (e.g.
+		// /research-agent) show up without a manual /reload.
+		this.session.onAfterReload?.(() => {
+			this.setupAutocompleteProvider();
+			const runner = this.session.extensionRunner;
+			this.setupExtensionShortcuts(runner);
+			this.showLoadedResources({ force: false, showDiagnosticsWhenQuiet: true });
+		});
+
 		const extensionRunner = this.session.extensionRunner;
 		this.setupExtensionShortcuts(extensionRunner);
 		this.showLoadedResources({ force: false, showDiagnosticsWhenQuiet: true });

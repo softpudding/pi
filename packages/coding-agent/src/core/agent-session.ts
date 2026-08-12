@@ -2614,6 +2614,14 @@ export class AgentSession {
 		});
 	}
 
+	/** Register a callback invoked after any reload() completes (direct/mid-turn
+	 *  reloads included), so consumers like the TUI can rebuild stale views
+	 *  (command autocomplete, shortcuts, resource status). */
+	private _afterReloadCallbacks: Array<() => void | Promise<void>> = [];
+	onAfterReload(callback: () => void | Promise<void>): void {
+		this._afterReloadCallbacks.push(callback);
+	}
+
 	async reload(options?: { beforeSessionStart?: () => void | Promise<void> }): Promise<void> {
 		const oldRunner = this._extensionRunner;
 		const previousFlagValues = oldRunner.getFlagValues();
@@ -2638,6 +2646,13 @@ export class AgentSession {
 			await options?.beforeSessionStart?.();
 			await this._extensionRunner.emit({ type: "session_start", reason: "reload" });
 			await this.extendResourcesFromExtensions("reload");
+		}
+		for (const cb of this._afterReloadCallbacks) {
+			try {
+				await cb();
+			} catch (e) {
+				console.error("[mdr] onAfterReload callback failed:", e);
+			}
 		}
 	}
 
