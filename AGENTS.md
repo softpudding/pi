@@ -70,6 +70,38 @@ If rebase conflicts occur:
 - If a conflict is in a file you did not modify, abort and ask the user.
 - Never force push.
 
+### Fork Workflow (this repo)
+
+Remotes: `origin` = official `earendil-works/pi`, `fork` = `softpudding/pi`.
+
+Branches:
+
+- `main` — official mirror. Tracks `origin/main`. Never commit directly; only `git pull origin main` / merge from `origin/main`.
+- `soft/main` — our integration branch (official + all our changes). Default working branch, pushed to `fork`. New features merge here.
+- `feat/*` — feature branches. Create from `soft/main`, develop, merge into `soft/main`, push to `fork`.
+- Keep `fork`'s `main` (GitHub) as an official mirror so the GitHub "Sync fork" button keeps working; our work lives on `soft/main`.
+
+Routine upstream sync:
+
+```bash
+git checkout main && git pull origin main    # 1. sync official mirror
+npm install --ignore-scripts                 # 2. refresh deps after upstream changes
+npm --prefix packages/tui run build && npm --prefix packages/telemetry run build && \
+  npm --prefix packages/ai run build:offline && npm --prefix packages/agent run build && \
+  npm --prefix packages/protocol run build && npm --prefix packages/client run build
+npm --prefix packages/coding-agent run build # 3. rebuild workspace dists (they go stale)
+git checkout soft/main && git merge main     # 4. merge official into integration branch
+# resolve conflicts (CHANGELOG: keep both official and our entries)
+git push fork soft/main                      # 5. backup
+```
+
+Notes:
+
+- After upstream updates, workspace `dist/` dirs (tui/telemetry/ai/agent/protocol/client/coding-agent) go stale and break the coding-agent build with cross-package type errors; rebuild them in the order above.
+- `packages/ai`'s `generate-models` fetches models.dev over the network. If it times out and `packages/ai/src/models.generated.ts` is unchanged, run `npm run build:offline` instead.
+- Conflicts on upstream merge only touch files we modified (CHANGELOG, docs, our src). For CHANGELOG conflicts, keep both official and our entries.
+- Local `pi` is `miniforge3/bin/pi -> packages/coding-agent/dist/cli.js` (compiled from the checked-out working tree). Rebuild `packages/coding-agent` after changing src for the local `pi` to pick it up.
+
 ## Issues and PRs
 
 See `CONTRIBUTING.md` for the contributor gate (auto-close workflows, `lgtm`/`lgtmi`, quality bar).
