@@ -29,6 +29,7 @@ For the JSONL file format and SessionManager API, see [Session Format](session-f
 | `/session` | Show session info |
 | `/tree` | Navigate the current session tree |
 | `/fork` | Create a new session from a previous user message |
+| `/rewind` | Rewind the conversation to a previous user message |
 | `/clone` | Duplicate the current active branch into a new session |
 | `/compact [prompt]` | Summarize older context; see [Compaction](compaction.md) |
 | `/export [file]` | Export session to HTML |
@@ -115,16 +116,22 @@ Selecting an assistant, tool, compaction, or other non-user entry:
 
 Selecting the root user message resets the leaf to an empty conversation and places the original prompt in the editor.
 
-## `/tree`, `/fork`, and `/clone`
+## `/tree`, `/fork`, `/rewind`, and `/clone`
 
-| Feature | `/tree` | `/fork` | `/clone` |
-|---------|---------|---------|----------|
-| Output | Same session file | New session file | New session file |
-| View | Full tree | User-message selector | Current active branch |
-| Typical use | Explore alternatives in place | Start a new session from an earlier prompt | Duplicate current work before continuing |
-| Summary | Optional branch summary | None | None |
+| Feature | `/tree` | `/fork` | `/rewind` | `/clone` |
+|---------|---------|---------|-----------|----------|
+| Output | Same session file | New session file | Same session file | New session file |
+| View | Full tree | User-message selector | User-message selector | Current active branch |
+| Typical use | Explore alternatives in place | Start a new session from an earlier prompt | Redo from an earlier prompt in place | Duplicate current work before continuing |
+| Summary | Optional branch summary | None | None | None |
 
 Use `/tree` when you want to keep alternatives together. Use `/fork` or `/clone` when you want a separate session file.
+
+## Rewinding with `/rewind`
+
+`/rewind` rolls the current session back to a previous user message, discarding that message and everything after it from the session file. The selected prompt is placed back in the editor so you can edit and resend it.
+
+Unlike `/tree` (which keeps every entry in the file and just moves the leaf) and `/fork` (which preserves the current session in a new file), `/rewind` physically truncates the session: the messages after the checkpoint are gone. There is no undo.
 
 ## Branch Summaries
 

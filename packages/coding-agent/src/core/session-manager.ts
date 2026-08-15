@@ -1374,6 +1374,33 @@ export class SessionManager {
 	}
 
 	/**
+	 * Rewind the session back to just before the specified checkpoint entry,
+	 * physically discarding the checkpoint and every entry after it.
+	 *
+	 * Only the path from the root to the checkpoint's parent is kept and the
+	 * session file is rewritten to match, so the tree becomes linear again. The
+	 * leaf pointer moves to the checkpoint's parent (null when rewinding past
+	 * the first entry), and the next appendXXX() call creates the checkpoint's
+	 * successor.
+	 *
+	 * Returns the new leaf id (or null when rewinding past the first entry).
+	 */
+	rewind(checkpointId: string): string | null {
+		const checkpoint = this.byId.get(checkpointId);
+		if (!checkpoint) {
+			throw new Error(`Entry ${checkpointId} not found`);
+		}
+
+		const kept = this.getBranch(checkpointId).filter((entry) => entry.id !== checkpointId);
+		const header = this.fileEntries.find((entry) => entry.type === "session");
+		this.fileEntries = header ? [header, ...kept] : [...kept];
+		this._buildIndex();
+		this._rewriteFile();
+		this.flushed = true;
+		return checkpoint.parentId;
+	}
+
+	/**
 	 * Start a new branch with a summary of the abandoned path.
 	 * Same as branch(), but also appends a branch_summary entry that captures
 	 * context from the abandoned conversation path.

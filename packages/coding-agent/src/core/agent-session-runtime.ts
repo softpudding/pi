@@ -352,6 +352,46 @@ export class AgentSessionRuntime {
 	}
 
 	/**
+	 * Rewind the current session back to just before a previous user message,
+	 * discarding the checkpoint and all entries after it from the session file.
+	 *
+	 * Unlike {@link fork}, this modifies the current session in place instead of
+	 * creating a new one. The checkpoint message text is returned so the caller
+	 * can preload it into the editor for re-sending.
+	 *
+	 * @throws {Error} When the entry does not exist or is not a user message.
+	 */
+	async rewind(entryId: string): Promise<{ cancelled: boolean; selectedText?: string }> {
+		const selectedEntry = this.session.sessionManager.getEntry(entryId);
+		if (!selectedEntry) {
+			throw new Error("Invalid entry ID for rewinding");
+		}
+		if (selectedEntry.type !== "message" || selectedEntry.message.role !== "user") {
+			throw new Error("Invalid entry ID for rewinding");
+		}
+
+		// Settle any active response before truncating the session file so no
+		// in-flight turn appends entries after the rewind point.
+		await this.session.abort();
+
+		const sessionManager = this.session.sessionManager;
+		const oldLeafId = sessionManager.getLeafId();
+		const newLeafId = sessionManager.rewind(entryId);
+
+		// Rebuild the agent message state to match the truncated session.
+		const sessionContext = sessionManager.buildSessionContext();
+		this.session.agent.state.messages = sessionContext.messages;
+
+		await this.session.extensionRunner.emit({
+			type: "session_tree",
+			newLeafId,
+			oldLeafId,
+		});
+
+		return { cancelled: false, selectedText: extractUserMessageText(selectedEntry.message.content) };
+	}
+
+	/**
 	 * Import a session JSONL file and switch runtime state to the imported session.
 	 *
 	 * @returns `{ cancelled: true }` when cancelled by `session_before_switch`, otherwise `{ cancelled: false }`.

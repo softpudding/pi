@@ -511,6 +511,64 @@ describe("AgentSessionRuntime characterization", () => {
 		await expect(runtime.fork("missing-entry")).rejects.toThrow("Invalid entry ID for forking");
 	});
 
+	it("rewinds the session in place to before a previous user message", async () => {
+		const { runtime } = await createRuntimeForTest(() => {});
+		await runtime.session.prompt("hello");
+		await runtime.session.prompt("again");
+		await runtime.session.prompt("third");
+
+		const userMessages = runtime.session.getUserMessagesForForking();
+		expect(userMessages.map((m) => m.text)).toEqual(["hello", "again", "third"]);
+
+		const sessionFile = runtime.session.sessionFile;
+		const second = userMessages[1];
+		const result = await runtime.rewind(second.entryId);
+		expect(result).toEqual({ cancelled: false, selectedText: "again" });
+
+		// Same session file (in place), messages truncated to before the checkpoint.
+		expect(runtime.session.sessionFile).toBe(sessionFile);
+		expect(runtime.session.messages.map((m) => m.role)).toEqual(["user", "assistant"]);
+		expect(runtime.session.getUserMessagesForForking().map((m) => m.text)).toEqual(["hello"]);
+	});
+
+	it("rewinds to the first user message resets the conversation", async () => {
+		const { runtime } = await createRuntimeForTest(() => {});
+		await runtime.session.prompt("hello");
+		await runtime.session.prompt("again");
+
+		const first = runtime.session.getUserMessagesForForking()[0];
+		const result = await runtime.rewind(first.entryId);
+		expect(result).toEqual({ cancelled: false, selectedText: "hello" });
+		expect(runtime.session.messages).toHaveLength(0);
+		expect(runtime.session.getUserMessagesForForking()).toHaveLength(0);
+	});
+
+	it("throws when rewinding with an invalid entry id", async () => {
+		const { runtime } = await createRuntimeForTest(() => {});
+		await runtime.session.prompt("hello");
+		await expect(runtime.rewind("missing-entry")).rejects.toThrow("Invalid entry ID for rewinding");
+	});
+
+	it("emits session_tree when rewinding", async () => {
+		const events: Array<{ newLeafId: string | null; oldLeafId: string | null }> = [];
+		const { runtime } = await createRuntimeForTest((pi: ExtensionAPI) => {
+			pi.on("session_tree", (event) => {
+				events.push({ newLeafId: event.newLeafId, oldLeafId: event.oldLeafId });
+			});
+		});
+		await runtime.session.prompt("hello");
+		await runtime.session.prompt("again");
+
+		const oldLeafId = runtime.session.sessionManager.getLeafId();
+		const first = runtime.session.getUserMessagesForForking()[0];
+		// Metadata entries (model/thinking-level changes) precede the first user
+		// message and are retained as the new leaf.
+		const expectedNewLeafId = runtime.session.sessionManager.getEntry(first.entryId)!.parentId;
+		await runtime.rewind(first.entryId);
+
+		expect(events).toEqual([{ newLeafId: expectedNewLeafId, oldLeafId }]);
+	});
+
 	it("updates the runtime session cwd on cross-cwd session replacement", async () => {
 		const firstDir = join(tmpdir(), `pi-runtime-cwd-a-${Date.now()}-${Math.random().toString(36).slice(2)}`);
 		const secondDir = join(tmpdir(), `pi-runtime-cwd-b-${Date.now()}-${Math.random().toString(36).slice(2)}`);

@@ -48,6 +48,7 @@ Type `/` in the editor to open command completion. Extensions can register custo
 | `/tree` | Jump to any point in the session and continue from there |
 | `/trust` | Save project trust decision for future sessions |
 | `/fork` | Create a new session from a previous user message |
+| `/rewind` | Rewind the conversation to a previous user message |
 | `/clone` | Duplicate the current active branch into a new session |
 | `/compact [prompt]` | Manually compact context, optionally with custom instructions |
 | `/copy` | Copy last assistant message to clipboard |
@@ -90,6 +91,7 @@ Useful session commands:
 - `/session` shows the current session file and ID.
 - `/tree` navigates the in-file session tree and can summarize abandoned branches.
 - `/fork` creates a new session from an earlier user message.
+- `/rewind` discards everything after an earlier user message in the current session.
 - `/clone` duplicates the current active branch into a new session file.
 - `/compact` summarizes older messages to free context.
 
