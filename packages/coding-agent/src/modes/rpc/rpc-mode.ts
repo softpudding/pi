@@ -615,6 +615,14 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 				return success(id, "fork", { text: result.selectedText, cancelled: result.cancelled });
 			}
 
+			case "rewind": {
+				const result = await runtimeHost.rewind(command.entryId);
+				if (!result.cancelled) {
+					await rebindSession();
+				}
+				return success(id, "rewind", { text: result.selectedText, cancelled: result.cancelled });
+			}
+
 			case "clone": {
 				const leafId = session.sessionManager.getLeafId();
 				if (!leafId) {

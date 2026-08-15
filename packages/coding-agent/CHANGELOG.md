@@ -5,6 +5,7 @@
 ### Added
 
 - Added a fullscreen exit output setting to choose between printing the final transcript and only a session resume hint.
+- Added a `/rewind` command that truncates the current session back to a previous user message, discarding later messages from the session file.
 
 ### Changed
 

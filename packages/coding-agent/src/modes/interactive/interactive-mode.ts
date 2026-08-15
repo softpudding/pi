@@ -2946,6 +2946,11 @@ export class InteractiveMode {
 				this.editor.setText("");
 				return;
 			}
+			if (text === "/rewind") {
+				this.showRewindSelector();
+				this.editor.setText("");
+				return;
+			}
 			if (text === "/clone") {
 				this.editor.setText("");
 				await this.handleCloneCommand();
@@ -4935,6 +4940,56 @@ export class InteractiveMode {
 					this.ui.requestRender();
 				},
 				initialSelectedId,
+			);
+			return { component: selector, focus: selector.getMessageList() };
+		});
+	}
+
+	private showRewindSelector(): void {
+		const userMessages = this.session.getUserMessagesForForking();
+
+		if (userMessages.length === 0) {
+			this.showStatus("No messages to rewind to");
+			return;
+		}
+
+		const initialSelectedId = userMessages[userMessages.length - 1]?.entryId;
+
+		this.showSelector((done) => {
+			const selector = new UserMessageSelectorComponent(
+				userMessages.map((m) => ({ id: m.entryId, text: m.text })),
+				async (entryId) => {
+					done();
+					try {
+						const result = await this.runtimeHost.rewind(entryId);
+						if (result.cancelled) {
+							this.ui.requestRender();
+							return;
+						}
+
+						// Drop UI state for the rewound-away conversation before re-rendering
+						this.chatContainer.clear();
+						this.pendingMessagesContainer.clear();
+						this.compactionQueuedMessages = [];
+						this.streamingComponent = undefined;
+						this.streamingMessage = undefined;
+						this.pendingTools.clear();
+						this.renderInitialMessages();
+						this.editor.setText(result.selectedText ?? "");
+						this.showStatus("Rewound to previous message");
+					} catch (error: unknown) {
+						this.showError(error instanceof Error ? error.message : String(error));
+					}
+				},
+				() => {
+					done();
+					this.ui.requestRender();
+				},
+				initialSelectedId,
+				{
+					title: "Rewind to Message",
+					subtitle: "Discards the selected message and everything after it from this session",
+				},
 			);
 			return { component: selector, focus: selector.getMessageList() };
 		});
