@@ -344,6 +344,14 @@ export interface ExtensionContext {
 	compact(options?: CompactOptions): void;
 	/** Get the current effective system prompt. */
 	getSystemPrompt(): string;
+
+	/**
+	 * Hot-reload the extension runtime (extensions, skills, prompts, themes,
+	 * context files). Available in all contexts including tools/events: runs
+	 * directly without the TUI streaming guard and does NOT end the agent loop,
+	 * so a tool can reload and keep going in the same turn.
+	 */
+	reload?(): Promise<void>;
 }
 
 /**
@@ -384,6 +392,13 @@ export interface ExtensionCommandContext extends ExtensionContext {
 
 	/** Reload extensions, skills, prompts, themes, and context files. */
 	reload(): Promise<void>;
+
+	/** Inject a user message into the transcript (deliverAs: "steer" | "followUp").
+	 *  Lets command handlers kick off an agent turn (e.g. run a workflow). */
+	sendUserMessage(
+		content: string | (TextContent | ImageContent)[],
+		options?: { deliverAs?: "steer" | "followUp" },
+	): Promise<void>;
 }
 
 /**
@@ -1684,6 +1699,7 @@ export interface ExtensionCommandContextActions {
 		options?: { withSession?: (ctx: ReplacedSessionContext) => Promise<void> },
 	) => Promise<{ cancelled: boolean }>;
 	reload: () => Promise<void>;
+	sendUserMessage: SendUserMessageHandler;
 }
 
 /**

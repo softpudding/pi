@@ -341,6 +341,7 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 				reload: async () => {
 					await session.reload();
 				},
+				sendUserMessage: (content, options) => session.sendUserMessage(content, options),
 			},
 			shutdownHandler: () => {
 				shutdownRequested = true;

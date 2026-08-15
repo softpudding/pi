@@ -20,9 +20,22 @@ export function wrapRegisteredTool(registeredTool: RegisteredTool, runner: Exten
 	return {
 		...tool,
 		execute: async (toolCallId, params, signal, onUpdate) => {
-			const activeBefore = runner.getActiveTools();
+			// runner.getActiveTools() asserts active; a tool may reload the extension
+			// mid-execute (ctx.reload()), invalidating the runner — treat both reads
+			// as best-effort and skip addedToolNames bookkeeping in that case.
+			let activeBefore: string[] = [];
+			try {
+				activeBefore = runner.getActiveTools();
+			} catch {
+				/* stale-safe */
+			}
 			const result = await execute(toolCallId, params, signal, onUpdate);
-			const activeAfter = runner.getActiveTools();
+			let activeAfter: string[] = [];
+			try {
+				activeAfter = runner.getActiveTools();
+			} catch {
+				/* runner was reloaded mid-execute — addedToolNames is best-effort */
+			}
 			if (!activeBefore.every((name) => activeAfter.includes(name))) return result;
 
 			const beforeNames = new Set(activeBefore);

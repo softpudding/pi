@@ -53,6 +53,7 @@ import type {
 	ResolvedCommand,
 	ResourcesDiscoverEvent,
 	ResourcesDiscoverResult,
+	SendUserMessageHandler,
 	SessionBeforeCompactResult,
 	SessionBeforeForkResult,
 	SessionBeforeSwitchResult,
@@ -291,6 +292,8 @@ export class ExtensionRunner {
 	private navigateTreeHandler: NavigateTreeHandler = async () => ({ cancelled: false });
 	private switchSessionHandler: SwitchSessionHandler = async () => ({ cancelled: false });
 	private reloadHandler: ReloadHandler = async () => {};
+	private sendUserMessageHandler: SendUserMessageHandler = async () => {};
+	private directReloadHandler: () => Promise<void> = async () => {};
 	private shutdownHandler: ShutdownHandler = () => {};
 	private shortcutDiagnostics: ResourceDiagnostic[] = [];
 	private commandDiagnostics: ResourceDiagnostic[] = [];
@@ -419,6 +422,7 @@ export class ExtensionRunner {
 			this.navigateTreeHandler = actions.navigateTree;
 			this.switchSessionHandler = actions.switchSession;
 			this.reloadHandler = actions.reload;
+			this.sendUserMessageHandler = actions.sendUserMessage;
 			return;
 		}
 
@@ -428,11 +432,22 @@ export class ExtensionRunner {
 		this.navigateTreeHandler = async () => ({ cancelled: false });
 		this.switchSessionHandler = async () => ({ cancelled: false });
 		this.reloadHandler = async () => {};
+		this.sendUserMessageHandler = async () => {};
 	}
 
 	setUIContext(uiContext?: ExtensionUIContext, mode: ExtensionMode = "print"): void {
 		this.uiContext = uiContext ?? noOpUIContext;
 		this.mode = mode;
+	}
+
+	/**
+	 * Bind a reload implementation that runs directly (no TUI streaming guard,
+	 * no UI). Used by ExtensionContext.reload() so tools/events can hot-reload
+	 * the extension runtime mid-turn without ending the agent loop or injecting
+	 * a resume message into the transcript.
+	 */
+	bindDirectReload(handler: () => Promise<void>): void {
+		this.directReloadHandler = handler;
 	}
 
 	getUIContext(): ExtensionUIContext {
@@ -747,6 +762,10 @@ export class ExtensionRunner {
 				runner.assertActive();
 				return runner.getSystemPromptFn();
 			},
+			reload: () => {
+				runner.assertActive();
+				return runner.directReloadHandler();
+			},
 		};
 	}
 
@@ -765,6 +784,10 @@ export class ExtensionRunner {
 		context.waitForIdle = () => {
 			this.assertActive();
 			return this.waitForIdleFn();
+		};
+		context.sendUserMessage = async (content, options) => {
+			this.assertActive();
+			await this.sendUserMessageHandler(content, options);
 		};
 		context.newSession = (options) => {
 			this.assertActive();

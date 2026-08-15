@@ -1119,9 +1119,13 @@ export class AgentSession {
 		let messages: AgentMessage[] | undefined;
 
 		try {
-			// Handle extension commands first (execute immediately, even during streaming)
+			// Handle extension commands first (execute immediately, even during streaming).
 			// Extension commands manage their own LLM interaction via pi.sendMessage()
-			if (expandPromptTemplates && text.startsWith("/")) {
+			// NOTE: command routing is intentionally NOT gated by expandPromptTemplates,
+			// so programmatic messages (pi.sendUserMessage with expandPromptTemplates:false)
+			// can still trigger extension commands like /mdr-reload. Only exact command
+			// names match, so arbitrary "/..." text still flows through as a normal prompt.
+			if (text.startsWith("/")) {
 				const handled = await this._tryExecuteExtensionCommand(text);
 				if (handled) {
 					// Extension command executed, no prompt to send
@@ -2315,6 +2319,9 @@ export class AgentSession {
 	private _applyExtensionBindings(runner: ExtensionRunner): void {
 		runner.setUIContext(this._extensionUIContext, this._extensionMode);
 		runner.bindCommandContext(this._extensionCommandContextActions);
+		// tool/event contexts get a direct reload: hot-reload the extension runtime
+		// mid-turn without the TUI streaming guard and without ending the agent loop
+		runner.bindDirectReload(() => this.reload());
 
 		this._extensionErrorUnsubscriber?.();
 		this._extensionErrorUnsubscriber = this._extensionErrorListener
@@ -2607,6 +2614,14 @@ export class AgentSession {
 		});
 	}
 
+	/** Register a callback invoked after any reload() completes (direct/mid-turn
+	 *  reloads included), so consumers like the TUI can rebuild stale views
+	 *  (command autocomplete, shortcuts, resource status). */
+	private _afterReloadCallbacks: Array<() => void | Promise<void>> = [];
+	onAfterReload(callback: () => void | Promise<void>): void {
+		this._afterReloadCallbacks.push(callback);
+	}
+
 	async reload(options?: { beforeSessionStart?: () => void | Promise<void> }): Promise<void> {
 		const oldRunner = this._extensionRunner;
 		const previousFlagValues = oldRunner.getFlagValues();
@@ -2631,6 +2646,13 @@ export class AgentSession {
 			await options?.beforeSessionStart?.();
 			await this._extensionRunner.emit({ type: "session_start", reason: "reload" });
 			await this.extendResourcesFromExtensions("reload");
+		}
+		for (const cb of this._afterReloadCallbacks) {
+			try {
+				await cb();
+			} catch (e) {
+				console.error("[mdr] onAfterReload callback failed:", e);
+			}
 		}
 	}
 
