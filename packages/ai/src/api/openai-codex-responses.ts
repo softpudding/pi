@@ -499,7 +499,10 @@ export const streamSimple: StreamFunction<"openai-codex-responses", SimpleStream
 		throw new Error(`No API key for provider: ${model.provider}`);
 	}
 
-	const base = buildBaseOptions(model, context, options, apiKey);
+	const base = {
+		...buildBaseOptions(model, context, options, apiKey),
+		toolChoice: options?.toolChoice,
+	} satisfies OpenAICodexResponsesOptions;
 	const clampedReasoning = options?.reasoning ? clampThinkingLevel(model, options.reasoning) : undefined;
 	const reasoningEffort = clampedReasoning === "off" ? undefined : clampedReasoning;
 
@@ -575,7 +578,9 @@ function buildRequestBody(
 	if (options?.reasoningEffort !== undefined) {
 		const effort =
 			options.reasoningEffort === "none"
-				? (model.thinkingLevelMap?.off ?? "none")
+				? model.thinkingLevelMap?.off === undefined
+					? "none"
+					: model.thinkingLevelMap.off
 				: (model.thinkingLevelMap?.[options.reasoningEffort] ?? options.reasoningEffort);
 		if (effort !== null) {
 			body.reasoning = {
@@ -583,6 +588,8 @@ function buildRequestBody(
 				summary: options.reasoningSummary ?? "auto",
 			};
 		}
+	} else if (model.reasoning && model.thinkingLevelMap?.off !== null) {
+		body.reasoning = { effort: model.thinkingLevelMap?.off ?? "none" };
 	}
 
 	return body;
@@ -779,8 +786,9 @@ async function* parseSSE(response: Response, signal?: AbortSignal): AsyncGenerat
 			if (signal?.aborted) {
 				throw new Error("Request was aborted");
 			}
-			if (done) break;
-			buffer += decoder.decode(value, { stream: true });
+			buffer += done ? decoder.decode() : decoder.decode(value, { stream: true });
+			// Treat EOF as terminating the residual SSE frame.
+			if (done && buffer.trim()) buffer += "\n\n";
 
 			let idx = buffer.indexOf("\n\n");
 			while (idx !== -1) {
@@ -806,6 +814,8 @@ async function* parseSSE(response: Response, signal?: AbortSignal): AsyncGenerat
 				}
 				idx = buffer.indexOf("\n\n");
 			}
+
+			if (done) break;
 		}
 	} finally {
 		signal?.removeEventListener("abort", onAbort);
