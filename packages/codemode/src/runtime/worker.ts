@@ -62,7 +62,7 @@ async function main(data: WorkerData): Promise<void> {
 	});
 
 	// Called from the prelude with primitives only.
-	const bridge = vm.newFunction("bridge", (kind, a, b, c) => {
+	const bridge = vm.newFunction("bridge", (kind, a, b, c, d) => {
 		switch (kind.toString()) {
 			case "call":
 			case "global":
@@ -92,6 +92,9 @@ async function main(data: WorkerData): Promise<void> {
 						ok: true,
 						value: b === undefined || b.isUndefined ? undefined : b.toString(),
 						writes: c.toString(),
+						...(d?.toString() === "next" || d?.toString() === "finish"
+							? { loopControl: d.toString() as "next" | "finish" }
+							: {}),
 					});
 				} else {
 					post({ type: "done", ok: false, error: b.toString() });

@@ -22,8 +22,8 @@
  * `stalled()` reports a script that has not finished while no host call is pending: with no timers
  * or I/O in the VM, nothing can ever resume it.
  * `globalsJson` lists `{ name, spread }`; `a.b` names are grouped into a frozen `a` object.
- * `bridge(kind, a, b, c)` with kind "call" or "global" (id, name, argsJson),
- * "output" ("text" or "console", text) or ("image", data, mimeType), or "done" (ok, valueJsonOrErrorJson, writesJson).
+ * `bridge(kind, a, b, c, d)` with kind "call" or "global" (id, name, argsJson),
+ * "output" ("text" or "console", text) or ("image", data, mimeType), or "done" (ok, valueJsonOrErrorJson, writesJson, loopControl).
  *
  * Before anything else the prelude freezes the built-ins and makes the built-in globals read-only.
  * The prelude shares them with the script, so a script that patched one (for example
@@ -147,11 +147,25 @@ export const PRELUDE_SOURCE: string = `(function (bridge, toolsJson, globalsJson
 	// Thrown by exit() to unwind the script after it already reported success.
 	const EXIT = Object.freeze({});
 
-	function done(ok, payload, writes) {
+	function done(ok, payload, writes, loopControl) {
 		if (finished) return;
 		finished = true;
-		bridge("done", ok, payload, writes);
+		bridge("done", ok, payload, writes, loopControl);
 	}
+
+	// Only the top-level returned value selects a decision. Plain objects, output, and calls to
+	// a helper whose value is discarded cannot impersonate loop control.
+	const loopValues = new WeakMap();
+	const loop = {};
+	for (const action of ["next", "finish"]) {
+		loop[action] = (value) => {
+			const control = Object.freeze(Object.create(null));
+			loopValues.set(control, { action, value });
+			return control;
+		};
+	}
+	Object.freeze(loop);
+	Object.defineProperty(globalThis, "loop", { value: loop, enumerable: true });
 
 	function serialize(value) {
 		return value === undefined ? undefined : stringify(value);
@@ -482,14 +496,15 @@ export const PRELUDE_SOURCE: string = `(function (bridge, toolsJson, globalsJson
 			promiseThen.call(
 				promise,
 				(value) => {
+					const control = loopValues.get(value);
 					let json;
 					try {
-						json = serialize(value);
+						json = serialize(control ? control.value : value);
 					} catch (error) {
 						done(false, describeError(error));
 						return;
 					}
-					done(true, json, serializeWrites());
+					done(true, json, serializeWrites(), control?.action);
 				},
 				(error) => {
 					done(false, describeError(error));

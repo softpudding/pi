@@ -32,6 +32,7 @@ export type {
 	CodemodeErrorKind,
 	CodemodeExecuteOptions,
 	CodemodeJsonSchema,
+	CodemodeLoopControl,
 	CodemodeOutputItem,
 	CodemodeResult,
 	CodemodeSandboxOptions,

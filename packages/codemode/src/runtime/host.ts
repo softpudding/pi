@@ -5,6 +5,7 @@ import type {
 	CodemodeCallStatus,
 	CodemodeError,
 	CodemodeExecuteOptions,
+	CodemodeLoopControl,
 	CodemodeOutputItem,
 	CodemodeResult,
 	CodemodeSandboxOptions,
@@ -31,6 +32,7 @@ const RESERVED_GLOBALS: ReadonlySet<string> = new Set([
 	"globalThis",
 	"store",
 	"load",
+	"loop",
 ]);
 
 function errorMessage(error: unknown): string {
@@ -259,7 +261,10 @@ class Execution {
 			return;
 		}
 		const value = message.value === undefined ? undefined : parseBridgeJson(message.value, "return value");
-		this.finish(undefined, value, parseStoreWrites(message.writes));
+		if (message.loopControl !== undefined && message.loopControl !== "next" && message.loopControl !== "finish") {
+			throw new BridgeError("invalid loop control");
+		}
+		this.finish(undefined, value, parseStoreWrites(message.writes), message.loopControl);
 	}
 
 	private async handleCall(message: Extract<WorkerToHostMessage, { type: "call" }>): Promise<void> {
@@ -294,7 +299,12 @@ class Execution {
 		this.post(reply);
 	}
 
-	private finish(error: CodemodeError | undefined, value?: unknown, writes?: CodemodeStoreWrites): void {
+	private finish(
+		error: CodemodeError | undefined,
+		value?: unknown,
+		writes?: CodemodeStoreWrites,
+		loopControl?: CodemodeLoopControl,
+	): void {
 		if (this.finished) return;
 		this.finished = true;
 		clearTimeout(this.timer);
@@ -312,6 +322,7 @@ class Execution {
 			: {
 					ok: true,
 					value,
+					...(loopControl ? { loopControl } : {}),
 					output: this.output,
 					calls: this.calls,
 					storeWrites: writes ?? { set: {}, delete: [] },

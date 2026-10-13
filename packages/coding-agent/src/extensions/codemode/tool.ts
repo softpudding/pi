@@ -23,7 +23,7 @@
 
 import { join } from "node:path";
 import type { AgentTool } from "@earendil-works/pi-agent-core";
-import type { CodemodeJsonSchema, CodemodeTool } from "@earendil-works/pi-codemode";
+import type { CodemodeJsonSchema, CodemodeLoopControl, CodemodeTool } from "@earendil-works/pi-codemode";
 import {
 	MCP_TYPESCRIPT_PREAMBLE,
 	mcpStructuredContentSchema,
@@ -120,6 +120,8 @@ export interface CodemodeNestedCall {
 
 export interface CodemodeToolDetails {
 	calls: CodemodeNestedCall[];
+	/** Successfully returned scheduling decision; the payload uses ordinary codemode output. */
+	loopControl?: CodemodeLoopControl;
 	/** Temp file with the full text output, when the output was truncated. */
 	fullOutputPath?: string;
 }
@@ -127,7 +129,8 @@ export interface CodemodeToolDetails {
 export const codemodeToolSystemPromptContribution = {
 	snippet: "Run JavaScript that calls other tools",
 	guidelines: [
-		"Use codemode to batch independent tool calls (Promise.allSettled), chain them, or filter large output, instead of many separate calls.",
+		"Make exactly one codemode call per response, with no other top-level tool calls. Batch independent tool calls inside that script (Promise.allSettled), chain them, or filter large output.",
+		"You control the agent loop through codemode. End every script with return loop.next(results) to continue reasoning, or return loop.finish(answer) to finish. Even a text-only answer must be delivered with return loop.finish(answer), not as a standalone assistant response.",
 	],
 } as const;
 
@@ -136,7 +139,15 @@ export const CODEMODE_DOCS_PATH = join(getDocsPath(), "codemode.md");
 
 const DESCRIPTION_INTRO = `Run JavaScript that calls other tools. The input is raw JavaScript (not JSON, no code fence), run as an async function body in a QuickJS sandbox: top-level \`await\` and \`return\` work. No Node, file system, network, or timers.
 - \`await tools.<name>({ ...args })\` resolves to a string, or an object if the tool's declaration says so, and rejects with an Error on failure. Calls still running when the script ends are cancelled.
-- Optional first line: \`// @options: {"max_output_tokens": 10000, "timeout_ms": 60000}\``;
+- Optional first line: \`// @options: {"max_output_tokens": 10000, "timeout_ms": 60000}\`
+
+Loop control (required): make exactly one codemode call per response, as its only top-level tool call, and return exactly one decision:
+- \`return loop.next(results)\`: return results through the usual tool-output path and request the next inference. All previous context remains; results are appended, not substituted for history. No nested tool call is required.
+- \`return loop.finish(answer)\`: return the final answer through the same output path and stop. No extra inference follows. Use this even when the task needs no tools.
+- Example continuation: \`const data = await tools.read({ path: "input.txt" }); return loop.next(data);\`
+- Example completion: \`return loop.finish("The answer is 42.");\`
+Multiple codemode calls, or codemode mixed with other top-level tool calls, are rejected before any script or tool executes. Put concurrent operations inside that one script, for example \`await Promise.allSettled([...])\`.
+Do not finish with a standalone text response. Do not merely print or call loop.next/finish: return its value. A plain return or exit() does not select a loop decision.`;
 
 /** One line per global. The details live in {@link CODEMODE_DOCS_PATH}. */
 function describeGlobals(models: boolean): string {

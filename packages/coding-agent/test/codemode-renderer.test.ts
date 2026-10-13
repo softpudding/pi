@@ -1,10 +1,13 @@
 import { stripVTControlCharacters } from "node:util";
 import type { AgentToolResult } from "@earendil-works/pi-agent-core";
-import type { Component } from "@earendil-works/pi-tui";
+import { fauxAssistantMessage } from "@earendil-works/pi-ai";
+import type { Component, TUI } from "@earendil-works/pi-tui";
 import { beforeAll, describe, expect, it } from "vitest";
 import type { ToolRenderContext } from "../src/core/extensions/types.ts";
 import { codemodeRenderers } from "../src/extensions/codemode/renderer.ts";
 import type { CodemodeToolDetails } from "../src/extensions/codemode/tool.ts";
+import { AssistantMessageComponent } from "../src/modes/interactive/components/assistant-message.ts";
+import { ToolExecutionComponent } from "../src/modes/interactive/components/tool-execution.ts";
 import { initTheme, theme } from "../src/modes/interactive/theme/theme.ts";
 
 function render(
@@ -42,8 +45,115 @@ function render(
 		.trim();
 }
 
+function createToolComponent(outputPad = 1): ToolExecutionComponent {
+	return new ToolExecutionComponent(
+		"codemode",
+		"call",
+		{ code: "return loop.finish(answer);" },
+		{ showImages: false, outputPad },
+		codemodeRenderers,
+		{ requestRender: () => {} } as TUI,
+		"/",
+	);
+}
+
 describe("codemode renderer", () => {
 	beforeAll(() => initTheme("dark"));
+
+	it.each([0, 1, 3])("renders finish like an assistant reply outside the tool box (padding %s)", (outputPad) => {
+		const answer = `# Final answer\n\n**Verified**: \`42\`.\n\n${"完整的中文回复。 ".repeat(30)}`;
+		const result = {
+			content: [
+				{ type: "text" as const, text: "Script completed\nWall time 0.1 seconds\nOutput:\n" },
+				{ type: "text" as const, text: answer },
+			],
+			details: {
+				calls: [{ id: "call/1", name: "read", args: '{"path":"a"}', status: "ok" as const, durationMs: 5 }],
+				loopControl: "finish" as const,
+			},
+			isError: false,
+		};
+		const original = structuredClone(result);
+		const live = createToolComponent(outputPad);
+		live.markExecutionStarted();
+		live.updateResult({ content: [], details: { calls: [] }, isError: false }, true);
+		live.updateResult(result);
+		const replay = createToolComponent(outputPad);
+		replay.updateResult(structuredClone(result));
+
+		for (const expanded of [false, true]) {
+			live.setExpanded(expanded);
+			replay.setExpanded(expanded);
+			for (const width of [30, 100]) {
+				const expected = new AssistantMessageComponent(
+					fauxAssistantMessage(answer),
+					false,
+					undefined,
+					undefined,
+					outputPad,
+				).render(width);
+				const lines = live.render(width);
+				expect(lines.slice(-expected.length)).toEqual(expected);
+				expect(replay.render(width)).toEqual(lines);
+				const text = stripVTControlCharacters(lines.join("\n"));
+				expect(text).toContain("read");
+				expect(text.match(/Final answer/g)).toHaveLength(1);
+				expect(text).not.toContain("Script completed");
+			}
+		}
+		expect(result).toEqual(original);
+	});
+
+	it("keeps next, failed, and partial results in the tool view", () => {
+		for (const state of [
+			{ loopControl: "next" as const, isError: false, partial: false },
+			{ loopControl: "finish" as const, isError: true, partial: false },
+			{ loopControl: "finish" as const, isError: false, partial: true },
+			{ loopControl: undefined, isError: false, partial: false },
+		]) {
+			const component = createToolComponent();
+			component.updateResult(
+				{
+					content: [{ type: "text", text: "**not a final reply**" }],
+					details: { calls: [], loopControl: state.loopControl },
+					isError: state.isError,
+				},
+				state.partial,
+			);
+			const rendered = component.render(80).join("\n");
+			expect(rendered).not.toContain("\x1b]133;A\x07");
+			if (!state.partial) expect(stripVTControlCharacters(rendered)).toContain("**not a final reply**");
+		}
+	});
+
+	it("updates final replies when padding, theme, or result content changes", () => {
+		const component = createToolComponent();
+		const result = {
+			content: [{ type: "text" as const, text: "**Original answer**" }],
+			details: { calls: [], loopControl: "finish" as const },
+			isError: false,
+		};
+		component.updateResult(result);
+		component.render(80);
+		try {
+			initTheme("light");
+			component.setOutputPad(2);
+			component.updateResult({ ...result, content: [{ type: "text", text: "**Redacted answer**" }] });
+			component.invalidate();
+			const expected = new AssistantMessageComponent(
+				fauxAssistantMessage("**Redacted answer**"),
+				false,
+				undefined,
+				undefined,
+				2,
+			).render(80);
+			const lines = component.render(80);
+			expect(lines.slice(-expected.length)).toEqual(expected);
+			expect(stripVTControlCharacters(lines.join("\n"))).not.toContain("Original answer");
+		} finally {
+			initTheme("dark");
+		}
+	});
 
 	it("hides the script header and shows the output", () => {
 		const text = render({

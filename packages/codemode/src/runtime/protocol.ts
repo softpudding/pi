@@ -1,4 +1,4 @@
-import type { CodemodeOutputItem } from "../types.ts";
+import type { CodemodeLoopControl, CodemodeOutputItem } from "../types.ts";
 import type { CodemodeWasmModule } from "../wasm.ts";
 
 /**
@@ -31,7 +31,7 @@ export type WorkerToHostMessage =
 	| { type: "call"; id: number; target: "tool" | "global"; name: string; args: string | undefined }
 	| { type: "output"; item: CodemodeOutputItem }
 	/** `writes` is a JSON array of `[key, json]` for `store()` and `[key]` for deletions. */
-	| { type: "done"; ok: true; value: string | undefined; writes: string }
+	| { type: "done"; ok: true; value: string | undefined; writes: string; loopControl?: CodemodeLoopControl }
 	| { type: "done"; ok: false; error: ScriptErrorJson }
 	/** The VM failed outside the script's control, for example a wasm trap. */
 	| { type: "crash"; message: string };

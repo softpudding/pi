@@ -17,6 +17,31 @@ A script may start with an options line:
 
 The result starts with `Script completed` or `Script failed`, the wall time, and the output. Text and image items appear in order, each on its own line. When the output has more than one text item (from `text()` or `return`), each starts with a `==> text N/M <==` line. `console` calls follow in one `<console_output>` block with one line per call. A failed script keeps its partial output, followed by `Script error:` and the error. Tool calls are real: calls made before a failure are not undone. Calls still running when the script ends are cancelled, and unawaited promises are discarded.
 
+## Explicit loop control (pi-mih experiment)
+
+When codemode is active, return a loop decision from each script:
+
+```js
+return loop.next(results); // Append results and request the next inference.
+return loop.finish(answer); // Return the final answer and stop.
+```
+
+Make exactly one codemode call per response, with no other top-level tool calls. Multiple codemode calls, or codemode mixed with another top-level tool, cause the entire batch to be rejected before any script or tool implementation executes. Each call receives an ordinary error result, and the extension requests a correction using the same bounded recovery described below. This applies under both parallel and sequential scheduling. Put all batching and concurrency inside the single script, for example:
+
+```js
+const results = await Promise.allSettled([
+  tools.read({ path: "first.txt" }),
+  tools.read({ path: "second.txt" }),
+]);
+return loop.next(results);
+```
+
+Both helpers pass their payload through the existing return-value output path: formatting, truncation, images, store writes, tool-result messages, and provider conversion are unchanged. `loop.next` does not replace history; the next inference sees the previous context plus the newly appended result. Neither helper calls the LLM inside the sandbox.
+
+Only successfully returning a helper's value commits its decision. Printing a control value, discarding it, returning a plain value, or calling `exit()` does not commit loop control. Existing output and script-success behavior are preserved in those cases, but the extension appends a correction asking for an explicit decision. A text-only assistant response receives the same correction instead of ending the run. After three consecutive corrections without a valid decision, the run is aborted with a visible protocol error. Provider errors and user cancellation do not trigger corrections.
+
+`finish` uses Pi's existing tool-result `terminate` flag. It suppresses the automatic follow-up inference; queued user input, batches without codemode, and trusted extension scheduling retain their existing behavior. Its payload stays in the codemode tool result, not a synthetic assistant message. In the interactive CLI, successful `finish` text output is displayed outside the tool box with the ordinary assistant Markdown renderer. It does not collapse with tool output, and resumed sessions use the same presentation. The script and nested-call records remain in the tool box. JSON/RPC still expose the original tool result; plain `--print` still prints only assistant text.
+
 ## Globals
 
 | Global | Purpose |
@@ -25,8 +50,10 @@ The result starts with `Script completed` or `Script failed`, the wall time, and
 | `text(value)` | Add a text item to the output. Strings are added as is, other values as JSON. |
 | `image(value)` | Add an image to the output: a base64 `data:` URL, an `{ image_url }` object, or an image block `{ type: "image", data, mimeType }` such as those returned by MCP tools and `models.generateImages()`. Remote URLs are not supported. PNG, JPEG, GIF, and WebP are accepted. Each image is also saved to a temp file, and the result names the path before the image. |
 | `console.log(...)` | Add a line to the `<console_output>` block after the other output. Arguments are joined with spaces; `info`, `warn`, `error`, and `debug` do the same. |
-| `return value` | A top-level `return` adds the value like `text()`. |
-| `exit()` | End the script successfully. |
+| `return loop.next(value)` | Add the value like `text()` and request the next inference with the existing context intact. |
+| `return loop.finish(value)` | Add the value like `text()` and stop the automatic loop. |
+| `return value` | Add ordinary output, but supply no loop decision; the agent requests a correction. |
+| `exit()` | End the script successfully without a loop decision; the agent requests a correction. |
 | `store(key, value)` / `load(key)` | Keep small JSON values across `codemode` calls. See [Store values](#store-values). |
 | `ALL_TOOLS` | Every callable tool as `{ name, description }`, including tools the description does not list. |
 | `searchTools(query, { limit?, namespace? })` | Rank callable tools by relevance (BM25, default limit 8). Resolves to `{ name, description }[]`. |
@@ -156,11 +183,11 @@ const results = await Promise.all(
     }),
   ),
 );
-return results.map((result, i) =>
+return loop.next(results.map((result, i) =>
   result.stopReason === "stop"
     ? { message: messages[i], sentiment: result.answers.sentiment.choice, urgency: result.answers.urgency.score }
     : { message: messages[i], error: result.errorMessage },
-);
+));
 ```
 
 ### Generate images
@@ -194,11 +221,12 @@ const painter = await models.getModelOfType("image", "openrouter", "google/gemin
 const result = await models.generateImages(painter, {
   input: [{ type: "text", text: "A red fox in the snow, watercolor" }],
 });
-if (result.stopReason !== "stop") return result.errorMessage;
+if (result.stopReason !== "stop") return loop.next(result.errorMessage);
 for (const block of result.output) {
   if (block.type === "image") image(block);
   else text(block.text);
 }
+return loop.finish("Image generated.");
 ```
 
 ## Limits

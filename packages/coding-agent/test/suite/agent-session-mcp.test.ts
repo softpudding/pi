@@ -737,11 +737,16 @@ return { docs, sameForAliases: aliases.every((alias) => JSON.stringify(alias) ==
 	it("does not hold the first prompt for codemode servers that are still connecting", async () => {
 		// The server never answers `initialize`.
 		const { harness } = await setupSlow({}, Number.POSITIVE_INFINITY);
-		harness.setResponses([fauxAssistantMessage("ready")]);
+		harness.setResponses([
+			fauxAssistantMessage([fauxToolCall("codemode", { code: 'return loop.finish("ready");' })], {
+				stopReason: "toolUse",
+			}),
+		]);
 
 		await harness.session.prompt("start");
 
-		expect(getAssistantTexts(harness)).toEqual(["ready"]);
+		expect(getMessageText(toolResult(harness, "codemode"))).toContain("ready");
+		expect(harness.faux.state.callCount).toBe(1);
 		// Codemode is activated from the config, before the server connects.
 		expect(declaredToolNames(harness)).toEqual(["codemode"]);
 	});

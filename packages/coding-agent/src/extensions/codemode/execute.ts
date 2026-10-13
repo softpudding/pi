@@ -513,12 +513,14 @@ export async function executeCodemode(
 	const wallTime = ((performance.now() - startedAt) / 1000).toFixed(1);
 	const header = `${result.ok ? "Script completed" : "Script failed"}\nWall time ${wallTime} seconds\nOutput:\n`;
 	const details = snapshot();
+	if (result.ok && result.loopControl) details.loopControl = result.loopControl;
 	if (truncated.fullOutputPath) details.fullOutputPath = truncated.fullOutputPath;
 	return {
 		content: [{ type: "text", text: header }, ...output],
 		details,
 		...(modelUsage ? { usage: modelUsage } : {}),
 		...(result.ok ? {} : { isError: true }),
+		...(result.ok && result.loopControl === "finish" ? { terminate: true } : {}),
 	};
 }
 

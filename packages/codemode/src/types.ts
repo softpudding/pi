@@ -80,11 +80,16 @@ export interface CodemodeStoreWrites {
 	delete: string[];
 }
 
+/** Scheduling metadata, separate from the returned payload and output. */
+export type CodemodeLoopControl = "next" | "finish";
+
 /** `output` is kept for failed executions too, up to the failure. `exit()` completes with `value: undefined`. */
 export type CodemodeResult =
 	| {
 			ok: true;
 			value: unknown;
+			/** Present only when the script successfully returns a loop.next/finish value. */
+			loopControl?: CodemodeLoopControl;
 			output: CodemodeOutputItem[];
 			calls: CodemodeCall[];
 			storeWrites: CodemodeStoreWrites;
@@ -97,7 +102,7 @@ export interface CodemodeSandboxOptions {
 	 * Functions exposed as top-level identifiers instead of on `tools`, for host helpers such as
 	 * attaching an image to the result. They behave like tools (JSON round trip, promise result)
 	 * but are not recorded in `result.calls`. Names must be identifiers and may not shadow the
-	 * built-in globals (`tools`, `ALL_TOOLS`, `console`, `text`, `image`, `exit`, `store`, `load`).
+	 * built-in globals (`tools`, `ALL_TOOLS`, `console`, `text`, `image`, `exit`, `store`, `load`, `loop`).
 	 */
 	globals?: CodemodeTool[];
 	/**

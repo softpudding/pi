@@ -3,13 +3,15 @@
  *
  * The call shows the script; the result lists the nested tool calls with their status as they
  * run and the cost of its model calls, followed by the script output without the "Script completed"
- * header. Nested calls are not
- * separate tool rows because they never reach the model as tool calls.
+ * header. Successful finish output uses the ordinary assistant component outside the tool box.
+ * Nested calls are not separate tool rows because they never reach the model as tool calls.
  */
 
-import { Container, Spacer, Text } from "@earendil-works/pi-tui";
+import { Box, Container, Spacer, Text } from "@earendil-works/pi-tui";
+import type { TSchema } from "typebox";
 import type { ToolDefinition } from "../../core/extensions/types.ts";
 import { getTextOutput, replaceTabs, str } from "../../core/tools/render-utils.ts";
+import { AssistantMessageComponent } from "../../modes/interactive/components/assistant-message.ts";
 import { keyHint } from "../../modes/interactive/components/keybinding-hints.ts";
 import { VisualLinePreview } from "../../modes/interactive/components/visual-truncate.ts";
 import { highlightCode, type Theme } from "../../modes/interactive/theme/theme.ts";
@@ -62,24 +64,38 @@ function formatCall(call: CodemodeNestedCall, theme: Theme, expanded: boolean): 
 	return line;
 }
 
+interface CodemodeRenderState {
+	/** Result rows within the tool box; the assistant reply is rendered separately. */
+	toolOutput?: Container;
+}
+
 export const codemodeRenderers: Pick<
-	ToolDefinition<any, CodemodeToolDetails | undefined>,
-	"renderCall" | "renderResult"
+	ToolDefinition<TSchema, CodemodeToolDetails | undefined, CodemodeRenderState>,
+	"renderShell" | "renderCall" | "renderResult"
 > = {
+	renderShell: "self",
 	renderCall(args, theme, context) {
 		// The code includes the `// @options:` line, so options show as part of the script.
 		const code = str((args as { code?: unknown } | undefined)?.code);
 		const title = theme.fg("toolTitle", theme.bold("codemode"));
-		const component = (context.lastComponent as Container | undefined) ?? new Container();
+		const component = (context.lastComponent as Box | undefined) ?? new Box(context.outputPad, 1);
+		component.setPaddingX(context.outputPad);
+		component.setBgFn((text) =>
+			theme.bg(context.isPartial ? "toolPendingBg" : context.isError ? "toolErrorBg" : "toolSuccessBg", text),
+		);
 		component.clear();
+		const call = new Container();
+		component.addChild(call);
+		context.state.toolOutput ??= new Container();
+		component.addChild(context.state.toolOutput);
 		if (code === null) {
-			component.addChild(new Text(`${title} ${theme.fg("error", "[invalid arg]")}`, 0, 0));
+			call.addChild(new Text(`${title} ${theme.fg("error", "[invalid arg]")}`, 0, 0));
 			return component;
 		}
-		component.addChild(new Text(title, 0, 0));
+		call.addChild(new Text(title, 0, 0));
 		if (code) {
 			const highlighted = highlightCode(replaceTabs(code.replace(/\r/g, "").trimEnd()), "javascript").join("\n");
-			component.addChild(
+			call.addChild(
 				context.expanded
 					? new Text(highlighted, 0, 0)
 					: new VisualLinePreview({
@@ -95,6 +111,8 @@ export const codemodeRenderers: Pick<
 	renderResult(result, options, theme, context) {
 		const component = (context.lastComponent as Container | undefined) ?? new Container();
 		component.clear();
+		const toolOutput = context.state.toolOutput ?? component;
+		toolOutput.clear();
 		const calls = result.details?.calls ?? [];
 		if (calls.length > 0) {
 			const shown = options.expanded ? calls : calls.slice(-CALL_PREVIEW_COUNT);
@@ -110,8 +128,8 @@ export const codemodeRenderers: Pick<
 				const total = priced.reduce((sum, call) => sum + (call.cost ?? 0), 0);
 				lines.push(theme.fg("muted", `Model calls: ${formatCost(total)}`));
 			}
-			component.addChild(new Spacer(1));
-			component.addChild(new Text(lines.join("\n"), 0, 0));
+			toolOutput.addChild(new Spacer(1));
+			toolOutput.addChild(new Text(lines.join("\n"), 0, 0));
 		}
 
 		// Drop the "Script completed\nWall time ...\nOutput:\n" header. Rejected input (invalid options)
@@ -121,18 +139,28 @@ export const codemodeRenderers: Pick<
 		const output = options.isPartial
 			? ""
 			: getTextOutput({ ...result, content: hasHeader ? rest : result.content }, context.showImages).trim();
-		if (output) {
+		if (output && !context.isError && result.details?.loopControl === "finish") {
+			component.addChild(
+				new AssistantMessageComponent(
+					{ content: [{ type: "text", text: output }], stopReason: "stop" },
+					false,
+					undefined,
+					undefined,
+					context.outputPad,
+				),
+			);
+		} else if (output) {
 			const color = context.isError ? "error" : "toolOutput";
 			const styled = replaceTabs(output)
 				.split("\n")
 				.map((line) => theme.fg(color, line))
 				.join("\n");
-			component.addChild(new Spacer(1));
+			toolOutput.addChild(new Spacer(1));
 			if (options.expanded) {
-				component.addChild(new Text(styled, 0, 0));
+				toolOutput.addChild(new Text(styled, 0, 0));
 			} else {
 				// Limit wrapped lines, not logical ones: script output is often one long JSON line.
-				component.addChild(
+				toolOutput.addChild(
 					new VisualLinePreview({
 						text: styled,
 						maxVisualLines: OUTPUT_PREVIEW_LINES,
@@ -142,7 +170,8 @@ export const codemodeRenderers: Pick<
 				);
 				// The collapsed preview hides the truncation notice at the end, so name the file here.
 				const fullOutputPath = result.details?.fullOutputPath;
-				if (fullOutputPath) component.addChild(new Text(theme.fg("muted", `Full output: ${fullOutputPath}`), 0, 0));
+				if (fullOutputPath)
+					toolOutput.addChild(new Text(theme.fg("muted", `Full output: ${fullOutputPath}`), 0, 0));
 			}
 		}
 		return component;
