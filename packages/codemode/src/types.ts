@@ -140,4 +140,6 @@ export interface CodemodeExecuteOptions {
 	 * `store()` calls come back as `result.storeWrites`; persisting them is up to the caller.
 	 */
 	store?: Readonly<Record<string, unknown>>;
+	/** Evaluate an ES module, then call an export. Without an export, return its callable export names. */
+	module?: { export?: string; args?: unknown[]; filename?: string };
 }

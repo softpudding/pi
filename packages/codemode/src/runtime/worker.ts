@@ -11,7 +11,7 @@
  * or embedded-module string specifier as `workerUrl`.
  */
 import { parentPort, workerData } from "node:worker_threads";
-import { JSException, type JSValueHandle, MAX_STACK_SIZE, QuickJS } from "quickjs-wasi";
+import { EvalFlags, JSException, type JSValueHandle, MAX_STACK_SIZE, QuickJS } from "quickjs-wasi";
 import { PRELUDE_SOURCE } from "./prelude-source.ts";
 import { isHostToWorkerMessage, type WorkerData, type WorkerToHostMessage } from "./protocol.ts";
 
@@ -148,6 +148,25 @@ async function main(data: WorkerData): Promise<void> {
 	// match the script as written.
 	let fn: JSValueHandle;
 	try {
+		if (data.module) {
+			vm.withScope(() => {
+				vm.callFunction(api.getProp("beginModule"), api);
+				const promise = vm.evalCode(
+					data.code,
+					data.module?.filename ?? "codemode-module.js",
+					EvalFlags.TYPE_MODULE,
+				);
+				vm.callFunction(
+					api.getProp("runModule"),
+					api,
+					promise,
+					data.module?.export === undefined ? vm.undefined : vm.newString(data.module.export),
+					vm.newString(JSON.stringify(data.module?.args ?? [])),
+				);
+			});
+			drain();
+			return;
+		}
 		fn = vm.evalCode(`(async (tools, console) => {${data.code}\n})`, "codemode.js");
 	} catch (error) {
 		if (!(error instanceof JSException)) throw error;

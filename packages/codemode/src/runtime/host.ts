@@ -109,6 +109,7 @@ interface PendingCall {
 
 interface ExecutionOptions {
 	code: string;
+	module?: CodemodeExecuteOptions["module"];
 	tools: ReadonlyMap<string, CodemodeTool>;
 	globals: ReadonlyMap<string, CodemodeTool>;
 	timeoutMs: number;
@@ -177,6 +178,7 @@ class Execution {
 		if (this.finished) return;
 		const workerData: WorkerData = {
 			code: options.code,
+			module: options.module,
 			tools: [...options.tools.values()].map((tool) => ({
 				name: tool.name,
 				jsName: toCodemodeIdentifier(tool.name),
@@ -367,11 +369,11 @@ export class CodemodeSandbox {
 		const namespaces = new Set<string>();
 		for (const global of options.globals ?? []) {
 			const parts = global.name.split(".");
-			if (parts.length > 2 || !parts.every((part) => IDENTIFIER.test(part)) || RESERVED_GLOBALS.has(parts[0])) {
+			if (!parts.every((part) => IDENTIFIER.test(part)) || RESERVED_GLOBALS.has(parts[0])) {
 				throw new Error(`Invalid global name "${global.name}"`);
 			}
 			if (this.globalsByName.has(global.name)) throw new Error(`Global "${global.name}" is already registered`);
-			if (parts.length === 2) namespaces.add(parts[0]);
+			for (let index = 1; index < parts.length; index++) namespaces.add(parts.slice(0, index).join("."));
 			this.globalsByName.set(global.name, global);
 		}
 		for (const name of namespaces) {
@@ -406,6 +408,7 @@ export class CodemodeSandbox {
 		if (this.closed) return Promise.reject(new Error("Sandbox is closed"));
 		const execution = new Execution({
 			code,
+			module: options.module,
 			tools: new Map(this.toolsByName),
 			globals: this.globalsByName,
 			timeoutMs: options.timeoutMs ?? this.timeoutMs,

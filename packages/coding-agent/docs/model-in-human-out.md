@@ -1,6 +1,6 @@
 # Model in, Human out
 
-Status: explicit codemode loop control is implemented experimentally in pi-mih. The implementation adds scheduling metadata and correction messages without changing result formatting, provider-message conversion, or append-only context. Model-authored tools, memory hooks, and compaction strategies remain design explorations.
+Status: explicit loop control, host filesystem/process primitives, versioned source modules, dynamic tool registration/removal, four event hooks, and branch-persistent state are implemented experimentally in pi-mih. See [the implemented API](codemode.md). Custom compaction and general context hooks remain explorations. The sections below preserve the design rationale; the API document defines current behavior.
 
 ## Thesis
 
@@ -73,7 +73,8 @@ return loop.next(results); // Continue with results as newly appended context.
 These are alternative returns, not two sequential actions. A script can choose between them based on execution results:
 
 ```js
-const result = await tools.bash({ command: "git diff --check" });
+// Assuming the model has already registered a shell tool from process primitives:
+const result = await host.tools.call({ name: "shell.run", args: { command: "git diff --check" } });
 if (result.exit_code !== 0) {
   return loop.next({ failures: result.output });
 }
@@ -109,7 +110,7 @@ Control metadata travels separately from rendered output. The host must not pars
 
 A response must contain exactly one codemode call and no other top-level tool calls. Two scripts could return conflicting decisions, or an ordinary sibling tool could perform a side effect outside the controlling script. The codemode extension therefore checks the complete assistant response before each top-level call executes. Multiple codemode calls, or codemode mixed with other top-level tools, reject the entire batch through ordinary error results before any tool implementation or script runs. The existing bounded correction then asks the model to consolidate its operations into one script. This rule also applies under sequential scheduling; serializing competing controllers would not resolve the ambiguity.
 
-Batching and concurrency belong inside that one script, for example `const results = await Promise.allSettled([...]); return loop.next(results);`. Nested tool calls retain their existing execution and permission checks. Use the existing `codemode.mode: "only"` setting to route underlying tools through scripts. The core scheduler is unchanged: `finish` still uses the existing `terminate` flag, now from the sole top-level call. Batches without codemode, queued user input, and trusted extension scheduling keep their existing behavior.
+Batching and concurrency belong inside that one script, for example `const results = await Promise.allSettled([...]); return loop.next(results);`. Nested tool calls retain their existing execution and permission checks. Atomic codemode now hides prebuilt tool declarations and exposes only model-owned tools through `host.tools.call`. The old `codemode.mode` and inline catalog settings no longer change this behavior. The core scheduler is unchanged: `finish` still uses the existing `terminate` flag, now from the sole top-level call. Direct model calls to prebuilt tools are rejected while atomic codemode is active. Queued user input and trusted extension scheduling remain in place.
 
 ### Model training and missing decisions
 
@@ -164,7 +165,7 @@ A candidate design keeps a stable provider-facing execution and discovery interf
 
 This matters for existing tools too. Changing native provider tool schemas can change the cached prefix. Pi already records tool changes as transcript deltas, but [some providers require a complete checkpoint](extensions.md#activate-tools-dynamically), which can invalidate that prefix. Dynamic registration alone therefore does not establish compatibility with this design.
 
-The stable interface is a candidate, not a selected API. Its value would be letting the model evolve executable capabilities and the observations they produce while preserving the committed provider prefix.
+The selected implementation is the stable codemode declaration plus `host.modules`, `host.tools`, and `host.hooks`. Its value would be letting the model evolve executable capabilities and the observations they produce while preserving the committed provider prefix.
 
 ## Exploration 3: model-defined memory and hooks
 
@@ -241,17 +242,17 @@ Pi's branch-aware sessions are a useful foundation for defining the scope of too
 The existing implementation provides several useful building blocks:
 
 - `packages/codemode/src/runtime/`: fresh QuickJS execution environments, a host bridge, cancellation, and output handling.
-- `packages/coding-agent/src/extensions/codemode/execute.ts`: tool composition, discovery, model helpers, and branch-aware store integration.
+- `packages/coding-agent/src/extensions/codemode/execute.ts`: primitive dispatch, model helpers, and branch-aware store integration; `runtime.ts` owns modules, tools, hooks, and persistent runtime state.
 - `packages/coding-agent/src/core/agent-session.ts`: nested calls through the normal tool pipeline, session state, and existing compaction integration.
 - `packages/agent/src/agent-loop.ts`: the existing tool-calling loop, host-side continuation and termination controls, and request preparation. These are integration points, not the proposed model-facing protocol.
 - [Extensions](extensions.md): tool registration and lifecycle integration points. These are host-side capabilities, not automatically available to codemode scripts.
 - [Compaction](compaction.md): existing thresholds, retained history, and custom summarization hooks.
 
-Codemode already selects its output and supports explicit retained state. Its VM state is temporary; explicit store writes persist only on successful execution. Tool effects are not rolled back on script failure. Scripts do not currently expose general tool registration or installation of lifecycle hooks.
+Codemode already selects its output and supports explicit retained state. Its VM state is temporary; explicit store writes persist only on successful execution. Tool effects are not rolled back on script failure. Scripts now save immutable source modules and bind named exports to tools or supported lifecycle hooks; arbitrary host extension loading is not exposed.
 
-Codemode's declaration can include an inline tool catalog. Preserving its name and input schema alone is insufficient if registering a tool changes that description. Any stable-interface experiment must account for the entire declaration and its provider representation.
+Codemode no longer includes an inline prebuilt tool catalog. Its complete description and input schema stay fixed when model-owned tools change; discovery happens through explicit registry calls.
 
-The minimal implementation adds `loop.next` and `loop.finish` as sandbox globals. Their payload becomes the ordinary return value; only a separate `loopControl` field crosses the worker bridge. The codemode tool records that field in result details and maps `finish` to the existing `terminate` flag. A `tool_call` handler rejects invalid top-level codemode batches before execution; a `turn_end` handler appends correction messages through Pi's existing boundary API. Core agent-loop, context-construction, and message-conversion behavior are unchanged. The codemode renderer presents successful `finish` output with the assistant message component without adding a transcript entry. The other exploratory APIs remain unimplemented.
+The minimal implementation adds `loop.next` and `loop.finish` as sandbox globals. Their payload becomes the ordinary return value; only a separate `loopControl` field crosses the worker bridge. The codemode tool records that field in result details and maps `finish` to the existing `terminate` flag. A `tool_call` handler rejects invalid top-level codemode batches before execution; a `turn_end` handler appends correction messages through Pi's existing boundary API. Core agent-loop, context-construction, and message-conversion behavior are unchanged. The codemode renderer presents successful `finish` output with the assistant message component without adding a transcript entry. The module/registry/state APIs and tool/agent hooks are now implemented. General memory-context integration and compaction policy remain unimplemented.
 
 ## Experiment and validation
 

@@ -1,20 +1,14 @@
 /**
- * Codemode, Tool Search, and MCP
+ * Codemode with model-authored tools
  *
- * The CLI loads `codemode`, `tool_search`, and MCP as built-in extensions. SDK sessions add
- * them to the resource loader's extension factories.
- *
- * `codemode` and `tool_search` are registered inactive. Enable them through the `defaultTools` setting
- * (`tools` would also restrict the session to the named tools, which hides MCP tools), or let the
- * MCP extension activate them: `codemode` for servers with `codemode` exposure, `tool_search` for
- * servers with `deferred` exposure.
+ * The model defines its operations from file and process primitives. Existing built-in and MCP
+ * tools are not exposed through codemode. Use defaultTools to select codemode without restricting
+ * the names of tools the model can subsequently register.
  */
 
 import {
 	createAgentSession,
 	createCodemodeExtension,
-	createMcpExtension,
-	createToolSearchExtension,
 	DefaultResourceLoader,
 	getAgentDir,
 	SessionManager,
@@ -26,18 +20,12 @@ const cwd = process.cwd();
 const resourceLoader = new DefaultResourceLoader({
 	cwd,
 	agentDir: getAgentDir(),
-	extensionFactories: [
-		createCodemodeExtension({ mode: "on" }),
-		createToolSearchExtension(),
-		// Reads mcp.json from the agent directory and the trusted project, like the CLI.
-		createMcpExtension(),
-	],
+	extensionFactories: [createCodemodeExtension()],
 });
 await resourceLoader.reload();
 
 const settingsManager = SettingsManager.create(cwd);
-// `+name` adds to the configured default tools instead of replacing them.
-settingsManager.applyOverrides({ defaultTools: ["+codemode", "+tool_search"] });
+settingsManager.applyOverrides({ defaultTools: ["codemode"] });
 
 const { session } = await createAgentSession({
 	resourceLoader,
@@ -46,7 +34,7 @@ const { session } = await createAgentSession({
 });
 
 try {
-	// Emits session_start, which connects the MCP servers in the background.
+	// Restores model-authored definitions for this session branch.
 	await session.bindExtensions({});
 	console.log("Active tools:", session.getActiveToolNames().join(", "));
 	session.subscribe((event) => {

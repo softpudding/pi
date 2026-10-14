@@ -1,4 +1,4 @@
-import type { CodemodeLoopControl, CodemodeOutputItem } from "../types.ts";
+import type { CodemodeExecuteOptions, CodemodeLoopControl, CodemodeOutputItem } from "../types.ts";
 import type { CodemodeWasmModule } from "../wasm.ts";
 
 /**
@@ -9,6 +9,7 @@ import type { CodemodeWasmModule } from "../wasm.ts";
 
 export interface WorkerData {
 	code: string;
+	module?: CodemodeExecuteOptions["module"];
 	/** `jsName` is the identifier the script uses; `description` is listed in `ALL_TOOLS`. */
 	tools: { name: string; jsName: string; description: string }[];
 	globals: { name: string; spread: boolean }[];

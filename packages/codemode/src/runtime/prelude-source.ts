@@ -144,6 +144,7 @@ export const PRELUDE_SOURCE: string = `(function (bridge, toolsJson, globalsJson
 	const pending = new Map();
 	let nextId = 1;
 	let finished = false;
+	let initializingModule = false;
 	// Thrown by exit() to unwind the script after it already reported success.
 	const EXIT = Object.freeze({});
 
@@ -209,6 +210,10 @@ export const PRELUDE_SOURCE: string = `(function (bridge, toolsJson, globalsJson
 	function caller(kind, name, spread) {
 		return (...args) =>
 			new Promise((resolve, reject) => {
+				if (initializingModule) {
+					reject(new ErrorCtor("Host operations are unavailable during module initialization; call them inside an exported function."));
+					return;
+				}
 				let json;
 				try {
 					json = serialize(spread ? args : args[0]);
@@ -264,22 +269,25 @@ export const PRELUDE_SOURCE: string = `(function (bridge, toolsJson, globalsJson
 		"ALL_TOOLS lists every tool; searchTools(query) finds tools by topic.",
 	);
 
-	const namespaces = new Map();
+	const namespaces = Object.create(null);
 	for (const { name, spread } of parse(globalsJson)) {
 		const fn = caller("global", name, spread);
-		const dot = name.indexOf(".");
-		if (dot === -1) {
-			Object.defineProperty(globalThis, name, { value: fn, enumerable: true });
-			continue;
+		const parts = name.split(".");
+		let parent = namespaces;
+		for (const part of parts.slice(0, -1)) {
+			if (!(part in parent)) parent[part] = Object.create(null);
+			parent = parent[part];
 		}
-		const namespace = name.slice(0, dot);
-		if (!namespaces.has(namespace)) namespaces.set(namespace, Object.create(null));
-		namespaces.get(namespace)[name.slice(dot + 1)] = fn;
+		parent[parts[parts.length - 1]] = fn;
 	}
-	for (const [namespace, members] of namespaces) {
-		Object.freeze(members);
-		const value = guard(members, namespace, Object.keys(members));
-		Object.defineProperty(globalThis, namespace, { value, enumerable: true });
+	function freezeNamespace(value, name) {
+		if (typeof value === "function") return value;
+		for (const key of Object.keys(value)) value[key] = freezeNamespace(value[key], name + "." + key);
+		Object.freeze(value);
+		return guard(value, name, Object.keys(value));
+	}
+	for (const name of Object.keys(namespaces)) {
+		Object.defineProperty(globalThis, name, { value: freezeNamespace(namespaces[name], name), enumerable: true });
 	}
 
 	// key -> JSON text. Sizes count key and JSON characters.
@@ -468,6 +476,18 @@ export const PRELUDE_SOURCE: string = `(function (bridge, toolsJson, globalsJson
 	Object.defineProperty(globalThis, "exit", { value: exit, enumerable: true });
 
 	return {
+		beginModule() {
+			initializingModule = true;
+		},
+		runModule(promise, exportName, argsJson) {
+			this.run(async () => {
+				const namespace = await promise;
+				initializingModule = false;
+				if (exportName === undefined) return Object.keys(namespace).filter((name) => typeof namespace[name] === "function").sort();
+				if (typeof namespace[exportName] !== "function") throw new TypeErrorCtor("Module export " + exportName + " is not a function");
+				return await namespace[exportName](...parse(argsJson));
+			});
+		},
 		settle(id, ok, payload) {
 			const entry = pending.get(id);
 			if (!entry) return;

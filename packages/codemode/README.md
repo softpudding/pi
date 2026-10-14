@@ -42,13 +42,29 @@ await sandbox.close();
 - `text(value)` appends a text item to `result.output`; values other than strings are JSON-stringified. `console.log/info/warn/error/debug` append text items with `console: true`.
 - `image(urlOrItem)` appends an image item. It accepts a base64 `data:` URL, `{ image_url }`, or an MCP `ImageContent` block (`{ type: "image", data, mimeType }`). Remote URLs are rejected.
 - `exit()` ends the script successfully right away, keeping its output and store writes.
-- `globals` passed to the sandbox are called as top-level functions, for example a host helper `image(ref)`. They behave like tools but are not recorded in `result.calls`. A name like `models.classify` puts the function on a frozen `models` object. With `spread: true`, `execute` receives all call arguments as an array instead of the first one, and `signature` replaces the declaration generated from the schemas.
+- `globals` passed to the sandbox are called as top-level functions, for example a host helper `image(ref)`. They behave like tools but are not recorded in `result.calls`. Dotted names support nested frozen namespaces, for example `host.fs.read` and `models.classify`. With `spread: true`, `execute` receives all call arguments as an array instead of the first one, and `signature` replaces the declaration generated from the schemas.
 - `store(key, value)` and `load(key)` read and write JSON values synchronously. See [Store](#store).
 - Nothing else: no timers, `fetch`, `process`, `require`, modules, or `WebAssembly`. `eval` and `Function` work but only produce more code inside the same VM.
 
 `timeoutMs: Infinity` disables the deadline; the script then runs until it settles or `signal` aborts it. A script that waits on a promise nothing can settle (no tool call pending, and the VM has no timers or I/O) fails right away instead of hanging.
 
 `memoryLimitBytes` caps the VM's heap. Allocations beyond it fail inside the script as `InternalError: out of memory`.
+
+## Source modules
+
+Pass `module: {}` to evaluate ES module source and list its callable named exports. Pass `module: { export: "run", args: [input], filename: "program.mjs" }` to invoke an export. Initialization cannot perform host calls; imports have no loader and are rejected. Each invocation evaluates the source in a fresh VM. Module results use the same cancellation, memory, error, and serialization rules as scripts.
+
+```ts
+const source = "export function double({ value }) { return value * 2; }";
+const inspected = await sandbox.execute(source, { module: {} });
+// inspected.value: ["double"] when ok
+const invoked = await sandbox.execute(source, {
+  module: { export: "double", args: [{ value: 21 }] },
+});
+// invoked.value: 42 when ok
+```
+
+The library does not persist source or register tools itself. The coding-agent extension provides those lifecycle operations using session entries and the ordinary extension tool pipeline.
 
 ## Store
 

@@ -15,7 +15,10 @@ async function setup(options: HarnessOptions = {}): Promise<Harness> {
 		...options,
 		initialActiveToolNames: options.initialActiveToolNames ?? ["codemode"],
 		settings: { compaction: { enabled: false }, retry: { enabled: false } },
-		extensionFactories: [createCodemodeExtension({ models: false }), ...(options.extensionFactories ?? [])],
+		extensionFactories: [
+			createCodemodeExtension({ models: false, defaultActive: false }),
+			...(options.extensionFactories ?? []),
+		],
 	});
 	harnesses.push(harness);
 	return harness;
@@ -33,29 +36,15 @@ afterEach(() => {
 
 describe("AgentSession explicit codemode loop", () => {
 	it("appends next results once, preserves the request prefix, and finishes without an extra inference", async () => {
-		let nestedCalls = 0;
-		const harness = await setup({
-			extensionFactories: [
-				(pi) => {
-					pi.registerTool({
-						name: "fixture",
-						label: "Fixture",
-						description: "Return fixture data",
-						exposure: "codemode",
-						parameters: Type.Object({}),
-						execute: async () => {
-							nestedCalls++;
-							return { content: [{ type: "text", text: "selected evidence" }], details: undefined };
-						},
-					});
-				},
-			],
-		});
+		const harness = await setup();
+		const install = `const m = await host.modules.put({id:"fixture",source:'export function run() { return {content:[{type:"text",text:"selected evidence"}],details:{}}; }'}); await host.tools.register({name:"fixture.run",description:"Return evidence",parameters:{type:"object"},handler:{module:m.id,revision:m.revision,export:"run"}});`;
 		const requests: TranscriptContext["messages"][] = [];
 		harness.setResponses([
 			(context) => {
 				requests.push(structuredClone(context.messages));
-				return script('text("visible"); console.log("diagnostic"); return loop.next(await tools.fixture({}));');
+				return script(
+					`${install}text("visible"); console.log("diagnostic"); return loop.next(await host.tools.call({name:"fixture.run",args:{}}));`,
+				);
 			},
 			(context) => {
 				requests.push(structuredClone(context.messages));
@@ -68,7 +57,9 @@ describe("AgentSession explicit codemode loop", () => {
 
 		expect(harness.faux.state.callCount).toBe(2);
 		expect(harness.getPendingResponseCount()).toBe(1);
-		expect(nestedCalls).toBe(1);
+		expect(
+			harness.eventsOfType("tool_execution_start").filter((event) => event.toolName === "fixture.run"),
+		).toHaveLength(1);
 		expect(requests[1].slice(0, requests[0].length)).toEqual(requests[0]);
 		expect(JSON.stringify(requests[1])).toContain("PREFIX-MARKER");
 		const results = harness.session.messages.filter((message) => message.role === "toolResult");
@@ -178,42 +169,25 @@ describe("AgentSession explicit codemode loop", () => {
 	});
 
 	it("allows concurrent nested calls inside one controller script", async () => {
-		const { promise: bothStarted, resolve } = Promise.withResolvers<void>();
-		const started: string[] = [];
-		const harness = await setup({
-			extensionFactories: [
-				(pi) => {
-					pi.registerTool({
-						name: "fixture",
-						label: "Fixture",
-						description: "Wait for both nested calls",
-						exposure: "codemode",
-						parameters: Type.Object({ value: Type.String() }),
-						execute: async (_id, { value }, signal) => {
-							started.push(value);
-							if (started.length === 2) resolve();
-							const onAbort = () => resolve();
-							signal?.addEventListener("abort", onAbort, { once: true });
-							await bothStarted;
-							signal?.removeEventListener("abort", onAbort);
-							return { content: [{ type: "text", text: value }], details: undefined };
-						},
-					});
-				},
-			],
-		});
+		const harness = await setup();
+		const source = `export async function run({value}) {
+      await host.state.set({key:value,value:true});
+      while (!(await host.state.get({key:value === "left" ? "right" : "left"}))) await host.clock.sleep({ms:5});
+      return {content:[{type:"text",text:value}],details:{}};
+    }`;
+		const install = `const m = await host.modules.put({id:"fixture",source:${JSON.stringify(source)}}); await host.tools.register({name:"fixture.run",description:"Wait for both calls",parameters:{type:"object",properties:{value:{type:"string"}},required:["value"]},handler:{module:m.id,revision:m.revision,export:"run"}});`;
 		harness.setResponses([
-			script(`// @options: {"timeout_ms": 3000}
+			script(`// @options: {"timeout_ms": 5000}
+${install}
 const results = await Promise.allSettled([
-  tools.fixture({ value: "left" }),
-  tools.fixture({ value: "right" }),
+  host.tools.call({name:"fixture.run",args:{value:"left"}}),
+  host.tools.call({name:"fixture.run",args:{value:"right"}}),
 ]);
 return loop.finish(results);`),
 			fauxAssistantMessage("must not run"),
 		]);
 
 		await harness.session.prompt("Batch the independent operations inside one script.");
-		expect(started.sort()).toEqual(["left", "right"]);
 		expect(harness.eventsOfType("tool_execution_start").filter((event) => event.parentToolCallId)).toHaveLength(2);
 		expect(harness.faux.state.callCount).toBe(1);
 		const result = getToolResult(harness, "codemode");
@@ -225,7 +199,7 @@ return loop.finish(results);`),
 		expect(reminders(harness)).toEqual([]);
 	});
 
-	it.each([true, false])("preserves batches without codemode (codemode active: %s)", async (active) => {
+	it.each([true, false])("allows legacy calls only when codemode is inactive (active: %s)", async (active) => {
 		let executions = 0;
 		const harness = await setup({
 			initialActiveToolNames: active ? ["codemode", "fixture"] : ["fixture"],
@@ -249,14 +223,14 @@ return loop.finish(results);`),
 			active ? script('return loop.finish("Done.");') : fauxAssistantMessage("Done."),
 		]);
 		await harness.session.prompt("Run ordinary tools.");
-		expect(executions).toBe(2);
+		expect(executions).toBe(active ? 0 : 2);
 		expect(harness.faux.state.callCount).toBe(2);
 		expect(reminders(harness)).toHaveLength(active ? 1 : 0);
 		expect(
 			harness.session.messages
 				.filter((message) => message.role === "toolResult")
 				.filter((message) => message.toolName === "fixture")
-				.every((result) => !result.isError),
+				.every((result) => Boolean(result.isError) === active),
 		).toBe(true);
 	});
 

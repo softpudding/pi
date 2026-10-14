@@ -1,88 +1,80 @@
 # Codemode
 
-The `codemode` tool lets the model write a JavaScript script that calls pi's other tools and runs non-LLM models, such as classifiers and image models. Only the script's output reaches the model, so a script can run calls in parallel and filter large results before the model sees them. To turn it on, see [Enable codemode](cli.md#enable-codemode).
+Codemode is active by default in pi-mih. The model receives one stable execution tool and builds its own reusable tools from host primitives. Built-in read/edit/write/bash, tool search, plugin tools, and MCP tools are not exposed through codemode. Their native declarations are hidden while codemode is active; direct model calls are rejected. SDK hosts can opt out with `createCodemodeExtension({ defaultActive: false })`.
 
-## Scripts
+The standalone `@earendil-works/pi-codemode` package still supports caller-injected functions. The coding-agent extension intentionally injects only the capabilities documented here.
 
-The tool input is raw JavaScript source, not JSON and not a markdown code fence. It runs as the body of an async function in a QuickJS sandbox, so top-level `await` and `return` work. The sandbox has no Node APIs, file system, network, or timers; scripts reach the outside world only through tools and `models`.
+## Execution and loop control
 
-A script may start with an options line:
+Input is raw JavaScript source, executed as an async function body in a fresh QuickJS VM. No Node imports or ambient filesystem access exist inside the VM. External operations use the host interfaces. Paths resolve from the session working directory; filesystem and child-process operations run with the host process's authority, independently of built-in read/bash implementations. Existing permission extensions that intercept those built-ins do not automatically mediate these primitives.
+
+Make exactly one top-level codemode call per response. Return `loop.next(results)` to append selected results and request another inference, or `loop.finish(answer)` to finish without an extra inference. Plain return, `text()`, `exit()`, or assistant prose does not finish the run. Missing decisions receive up to three corrections. Invalid batches are rejected before execution; cancellation and provider failures do not trigger corrections.
+
+`finish` remains a tool result in the transcript and RPC events. The interactive UI renders its text as an assistant reply. Plain `--print` still prints only assistant text; use RPC for automated runs that need the finish payload.
+
+An optional first line sets limits:
 
 ```js
 // @options: {"max_output_tokens": 2000, "timeout_ms": 60000}
 ```
 
-- `max_output_tokens` (default 10000) limits the output. Longer output keeps its start and end, and the full text is written to a temp file whose path is included in the result. A script fails when its output passes 16777216 characters of text and base64 image data or 100000 `text()`, `image()`, and `console` calls; write large data to a file with a tool instead.
-- `timeout_ms` is a hard deadline for the whole script. It is unset by default. Image generation can take minutes, so do not set a short deadline for scripts that generate images.
+The output budget defaults to 10000 estimated tokens. Longer output is saved to a file and the result includes its path. The default script deadline is unlimited; cancellation still interrupts execution. Each VM has a 256 MiB heap limit. Failed scripts preserve partial output and do not roll back external effects or committed registry changes. Unawaited operations are cancelled at invocation end.
 
-The result starts with `Script completed` or `Script failed`, the wall time, and the output. Text and image items appear in order, each on its own line. When the output has more than one text item (from `text()` or `return`), each starts with a `==> text N/M <==` line. `console` calls follow in one `<console_output>` block with one line per call. A failed script keeps its partial output, followed by `Script error:` and the error. Tool calls are real: calls made before a failure are not undone. Calls still running when the script ends are cancelled, and unawaited promises are discarded.
+## Host contract
 
-## Explicit loop control (pi-mih experiment)
+You build the harness you need from host primitives. There are no prebuilt read, write, edit, bash, search, or MCP tools in codemode. The tools object and ALL_TOOLS are empty; use host.tools for your own registered tools.
 
-When codemode is active, return a loop decision from each script:
+Required workflow for external operations: (1) write a reusable JavaScript module, (2) await host.modules.put, (3) await host.tools.register for an exported function, (4) await host.tools.call. Implement I/O using host primitives INSIDE the exported function; do not bypass tool registration with inline I/O in the top-level controller. The controller manages definitions and calls. When you need to understand the returned data, use loop.next(data), read the resulting observation in your next inference, then compose the requested answer and use loop.finish(answer). Returning unseen raw data with loop.finish does not perform reasoning or summarization. Do not ask the user to provide file contents that your primitives can read.
 
+All host functions are async and accept one object (or no argument when shown). Source is JavaScript ES module text with named exports, no imports or Node globals. Module initialization must have no host operations. Each invocation has a fresh VM; use host.state for persistent state. Tool and hook names must start with their module id followed by a dot. Saving code creates an immutable revision; registering selects it. Re-registering the same name replaces the whole binding. Registration commits immediately, also if a later script action fails.
+
+Example of defining an operation (adapt the module and schema to the actual task):
 ```js
-return loop.next(results); // Append results and request the next inference.
-return loop.finish(answer); // Return the final answer and stop.
+const m = await host.modules.put({id: "math", source: 'export async function double({value}) { const result = value * 2; return {content: [{type: "text", text: String(result)}], structuredContent: result, details: {}}; }'});
+await host.tools.register({name: "math.double", description: "Double a number", parameters: {type: "object", properties: {value: {type: "number"}}, required: ["value"]}, outputSchema: {type: "number"}, handler: {module: m.id, revision: m.revision, export: "double"}});
+return loop.next(await host.tools.call({name: "math.double", args: {value: 21}}));
 ```
 
-Make exactly one codemode call per response, with no other top-level tool calls. Multiple codemode calls, or codemode mixed with another top-level tool, cause the entire batch to be rejected before any script or tool implementation executes. Each call receives an ordinary error result, and the extension requests a correction using the same bounded recovery described below. This applies under both parallel and sequential scheduling. Put all batching and concurrency inside the single script, for example:
+Module and registry API:
+- host.modules.put({id, source}) -> {id, revision, exports: string[]}. Source limit 256 KiB. Returns only after validating the module.
+- host.modules.list() -> [{id, revision, exports}]; host.modules.get({id, revision?}) -> module including source, or undefined.
+- host.modules.remove({id}) removes its code versions, tools, hooks, and state. Already executing calls keep their loaded code.
+- host.tools.register({name, description, parameters, outputSchema?, handler: {module, revision, export}}) -> definition. parameters is an object JSON Schema.
+- An exported tool receives its args object and returns {content: [{type: "text", text: string} | {type: "image", data: base64, mimeType}], details, structuredContent?, isError?}. When outputSchema is declared, structuredContent must match it; host.tools.call returns structuredContent, otherwise joined text content. Failed calls throw.
+- host.tools.call({name, args}) invokes a currently registered tool immediately, including one registered in this script. Calls use normal validation and tool hooks.
+- host.tools.list(), host.tools.describe({name}), host.tools.unregister({name}). These see only model-defined tools, never built-ins.
+- host.hooks.register({id, event, handler: {module, revision, export}}), host.hooks.list(), host.hooks.unregister({id}). Events: tool_call, tool_result, agent_start, agent_end. Export receives the event object. tool_call may return {block: true, reason}; tool_result may return {content?, structuredContent?, details?, isError?}; other events are notifications. Handlers run in registration order with a 30-second deadline. Guard against triggering your own hook recursively.
+- host.registry.apply({tools?: ToolDefinition[], removeTools?: string[], hooks?: HookDefinition[], removeHooks?: string[]}) validates and commits a group of bindings together.
+- host.calls.list() -> [{id, handler}]; host.calls.cancel({id}) cancels a running module invocation. Unregistering only prevents future calls.
 
-```js
-const results = await Promise.allSettled([
-  tools.read({ path: "first.txt" }),
-  tools.read({ path: "second.txt" }),
-]);
-return loop.next(results);
-```
+File primitives (paths are relative to the working directory; no output truncation or line processing):
+- host.fs.read({path, offset?: byteOffset, length?: byteCount, encoding?: "utf8" | "base64"}) -> {data: string, bytes: number, eof: boolean}. Default offset 0, length 65536, encoding utf8. Maximum length 8 MiB. Continue with offset += bytes until eof for a complete file. For byte-perfect chunking, use base64; UTF-8 chunks can split a character.
+- host.fs.write({path, data: string, encoding?: "utf8" | "base64", append?: boolean}) -> {bytes}. Default replaces the file; parent directories must exist.
+- host.fs.stat({path}) -> {size, mtimeMs, type}; host.fs.list({path}) -> [{name, type}].
+- host.fs.mkdir({path, recursive?: boolean}), host.fs.rename({from, to}), host.fs.remove({path, recursive?: boolean}).
 
-Both helpers pass their payload through the existing return-value output path: formatting, truncation, images, store writes, tool-result messages, and provider conversion are unchanged. `loop.next` does not replace history; the next inference sees the previous context plus the newly appended result. Neither helper calls the LLM inside the sandbox.
+Process primitives:
+- host.process.spawn({program, args?: string[], cwd?: string, env?: Record<string,string>}) -> {id, stdin, stdout, stderr}. No implicit shell: use program "bash" and args ["-c", command] when you need one.
+- host.streams.read({id, maxBytes?: number, encoding?: "utf8" | "base64"}) -> {data, bytes, eof}; host.streams.write({id, data, encoding?}) -> {bytes}; host.streams.close({id}).
+- host.process.wait({id}) -> {exitCode, signal}; host.process.terminate({id}). Drain stdout and stderr concurrently before waiting to avoid a full pipe blocking the child. These handles belong to the current script or module invocation; its end closes streams and terminates its process trees. They cannot be reused in later calls.
 
-Only successfully returning a helper's value commits its decision. Printing a control value, discarding it, returning a plain value, or calling `exit()` does not commit loop control. Existing output and script-success behavior are preserved in those cases, but the extension appends a correction asking for an explicit decision. A text-only assistant response receives the same correction instead of ending the run. After three consecutive corrections without a valid decision, the run is aborted with a visible protocol error. Provider errors and user cancellation do not trigger corrections.
+State and environment:
+- host.env.info() -> {cwd, platform}; host.clock.now() -> {unixMs, monotonicMs}; host.clock.sleep({ms}).
+- host.state.get({key}), host.state.set({key, value}), host.state.delete({key}). JSON state is scoped to the module (or top-level codemode) and current session branch. Writes commit immediately. Total runtime definitions and state limit: 4 MiB.
+- host.session.history({offset?: number, limit?: number}) -> message entries from the current branch. Default limit 20, maximum 100. Runtime metadata is excluded.
 
-`finish` uses Pi's existing tool-result `terminate` flag. It suppresses the automatic follow-up inference; queued user input, batches without codemode, and trusted extension scheduling retain their existing behavior. Its payload stays in the codemode tool result, not a synthetic assistant message. In the interactive CLI, successful `finish` text output is displayed outside the tool box with the ordinary assistant Markdown renderer. It does not collapse with tool output, and resumed sessions use the same presentation. The script and nested-call records remain in the tool box. JSON/RPC still expose the original tool result; plain `--print` still prints only assistant text.
+Output with text(value), image(base64 image block), console.log(...), or the loop payload. store(key, value)/load(key) remain small per-branch JSON storage; unlike host.state, store writes commit only on script success. Module callbacks return their result directly; only the top-level codemode script chooses loop.next/finish.
 
-## Globals
 
-| Global | Purpose |
-|---|---|
-| `tools.<name>(args)` | Call a tool. See [Call tools](#call-tools). |
-| `text(value)` | Add a text item to the output. Strings are added as is, other values as JSON. |
-| `image(value)` | Add an image to the output: a base64 `data:` URL, an `{ image_url }` object, or an image block `{ type: "image", data, mimeType }` such as those returned by MCP tools and `models.generateImages()`. Remote URLs are not supported. PNG, JPEG, GIF, and WebP are accepted. Each image is also saved to a temp file, and the result names the path before the image. |
-| `console.log(...)` | Add a line to the `<console_output>` block after the other output. Arguments are joined with spaces; `info`, `warn`, `error`, and `debug` do the same. |
-| `return loop.next(value)` | Add the value like `text()` and request the next inference with the existing context intact. |
-| `return loop.finish(value)` | Add the value like `text()` and stop the automatic loop. |
-| `return value` | Add ordinary output, but supply no loop decision; the agent requests a correction. |
-| `exit()` | End the script successfully without a loop decision; the agent requests a correction. |
-| `store(key, value)` / `load(key)` | Keep small JSON values across `codemode` calls. See [Store values](#store-values). |
-| `ALL_TOOLS` | Every callable tool as `{ name, description }`, including tools the description does not list. |
-| `searchTools(query, { limit?, namespace? })` | Rank callable tools by relevance (BM25, default limit 8). Resolves to `{ name, description }[]`. |
-| `describeTool(name)` | Resolves to a tool's description and TypeScript declaration, or `undefined`. |
-| `describeNamespace(name)` | Resolves to `{ name, description?, instructions?, tools }` for a namespace such as an MCP server, or `undefined`. |
-| `models` | List and run non-LLM models. See [Models](#models). |
+## Lifecycle and persistence
 
-## Call tools
+Module revisions are SHA-256 hashes of their source. Tool/hook bindings store an explicit revision and export name. Saving another revision alone does not change bindings. Replacement affects future calls; executing calls retain the revision they started with. Unregistration prevents future calls and does not cancel active ones. Use `host.calls.cancel` for cancellation. Module removal removes all its revisions, bindings, and state; it does not undo external effects. A running removed revision can finish, including already-authorized effects.
 
-Every tool the session can call is a method of `tools`, named by its identifier: characters that are not valid in a JavaScript identifier become `_`, so the MCP tool `mcp__dev-radius__search` is `tools.mcp__dev_radius__search`. Each method takes one object with the tool's arguments.
+Each callback receives a fresh VM. Module initialization cannot invoke host operations. Mutable closures are not persistent storage. `host.state` is scoped by module and session branch, and commits immediately. Modules, bindings, and state changes are recorded as `codemode-runtime` session entries. Resume and tree navigation replay definitions and state only; they never execute module code. Hook subscriptions are rebuilt for the selected branch. `tool_call` and `tool_result` hooks participate in the existing ordered extension pipeline; errors are handled by that pipeline.
 
-What a call resolves to depends on the tool:
+Generated tools use ordinary schema validation, nested-call recording, and extension tool hooks. They are deferred registry entries and never modify the provider-facing codemode declaration. `host.tools.list/describe` explicitly discover the current model-owned registry. Built-in tool allowlists still apply at the session boundary: prefer `defaultTools: ["codemode"]` to a restrictive `--tools codemode` allowlist when newly named tools must register at runtime.
 
-- Tools with an output schema resolve to a structured value. `bash` resolves to `{ output, truncated, full_output_path?, exit_code, wall_time_seconds }`, also for non-zero exit codes. Its `output` is not limited to the 2000 lines or 50KB the model sees: it holds up to 1 MiB, and longer output keeps its first and last 512 KiB around an omission marker, with `truncated` set and the full output in `full_output_path`.
-- MCP tools resolve to their `CallToolResult`, including `isError` and `structuredContent`.
-- `read` resolves to the file's text, or for an image to an image block `{ type: "image", data, mimeType, note }` that `image()` shows. `data` is the base64 image the model would see and `note` the text that goes with it, such as resize hints.
-- Other tools, such as `edit` and `write`, resolve to their text output.
-
-A call that fails, is blocked, or gets invalid arguments rejects with an `Error` that carries the tool's error text. Use `Promise.allSettled()` to keep the results of the calls that succeed.
-
-The `codemode` description lists tools with their TypeScript declarations, grouped by namespace (for example one MCP server). Tools with `deferred` exposure, which includes MCP tools with the default `codemode` exposure, are not listed, so the description stays the same while MCP servers connect. Listed declarations share a budget of 3000 estimated tokens (`codemode.inlineBudget` in [settings](settings.md#tools)). Scripts find the other tools with `searchTools()`, `describeTool()`, `describeNamespace()`, or by filtering `ALL_TOOLS`.
-
-While `codemode` is active, `codemode.mode` in [settings](settings.md#tools) decides how the other tools are presented. With `on` (default) declared tools stay declared, and their descriptions say how to call them from scripts. With `only` they are hidden from the model and listed in the `codemode` description instead, so the model calls them through scripts. Tool declarations in the `codemode` description, `describeTool()`, and `ALL_TOOLS` carry the tools' prompt guidelines, since the system prompt rules only cover declared tools.
-
-## Store values
-
-`store(key, value)` keeps a JSON value under a string key for later `codemode` calls; storing `undefined` deletes the key. `load(key)` returns the value, or `undefined`. Writes are kept only when the script succeeds: each successful script that stores values appends a `codemode-store` custom entry to the session, so resumed sessions keep the values and each branch sees only the values written on its path.
-
-The store is for small state such as IDs, cursors, or summaries. One value may have at most 262144 characters of JSON and all values together at most 1048576. Do not store image data; show images with `image()`, which also saves them to a temp file.
+Process and stream handles last for one invocation; cross-turn process sessions are not implemented. Event hooks currently cover tool calls/results and agent start/end. General context rewriting, custom compaction, and arbitrary host extension loading remain outside this API.
 
 ## Models
 
@@ -228,9 +220,3 @@ for (const block of result.output) {
 }
 return loop.finish("Image generated.");
 ```
-
-## Limits
-
-- A script's VM has 256 MB of memory. Running out throws `InternalError: out of memory`; filter or aggregate large data instead of accumulating it.
-- A script that waits on a promise that can never settle (no tool call pending) fails immediately, since there are no timers.
-- Scripts cannot start other `codemode` scripts.

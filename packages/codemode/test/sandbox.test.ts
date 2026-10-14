@@ -486,7 +486,7 @@ describe("globals", () => {
 
 	it("rejects invalid and reserved global names", () => {
 		const execute = () => undefined;
-		for (const name of ["a.b.c", "a.", ".a", "tools.x", "store.x", "a.not-valid"]) {
+		for (const name of ["a..c", "a.", ".a", "tools.x", "store.x", "a.not-valid"]) {
 			expect(() => new CodemodeSandbox({ globals: [{ name, execute }] }), name).toThrow(/Invalid global/);
 		}
 		expect(

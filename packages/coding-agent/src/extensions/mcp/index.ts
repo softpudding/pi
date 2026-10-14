@@ -216,15 +216,6 @@ export function renderServersSection(servers: readonly McpServerListing[]): stri
 	return [intro, ...lines, ...omitted(listed.length - kept)].join("\n");
 }
 
-/**
- * Whether a codemode script needs the server: it names the server's namespace, or searches,
- * enumerates, or describes tools or namespaces, which may name the server in other forms.
- */
-function scriptNeedsServer(code: string, server: string): boolean {
-	if (/\b(searchTools|describeNamespace|describeTool|ALL_TOOLS)\b/.test(code)) return true;
-	return code.includes(mcpNamespace(server));
-}
-
 /** Short state for lists and the startup report. `withError` appends the first line of a failure. */
 function describeState(server: McpServer, withError = true): string {
 	if (!isEnabled(server)) return "disabled";
@@ -1060,16 +1051,18 @@ export function createMcpExtension(options: McpExtensionOptions = {}): Extension
 		// Every prompt lists the servers in the `mcp_servers` section as they are when it starts. Pi
 		// appends the section to the conversation when it changed, for example after a server connected.
 		pi.on("before_agent_start", async (event, ctx) => {
-			await waitForDirectServers(ctx);
 			const { sections } = event.systemPromptOptions;
+			if (pi.getActiveTools().includes(CODEMODE_TOOL_NAME) && pi.getAllTools().some(isCodemodeTool)) {
+				delete sections[MCP_SERVERS_SECTION];
+				return;
+			}
+			await waitForDirectServers(ctx);
 			const section = renderServersSection(servers);
 			if (section) sections[MCP_SERVERS_SECTION] = section;
 			else delete sections[MCP_SERVERS_SECTION];
 		});
 
-		// A codemode script waits for the servers it names, or for every server when it searches or
-		// enumerates tools, so their tools are registered before the script runs. tool_search and the
-		// resource tools reach every server, so they wait for all of them.
+		// Only prebuilt discovery/resource tools use these connections. Atomic codemode has no MCP bridge.
 		pi.on("tool_call", async (event, ctx) => {
 			const tool = pi.getAllTools().find((candidate) => candidate.name === event.toolName);
 			if (!tool) return;
@@ -1078,11 +1071,7 @@ export function createMcpExtension(options: McpExtensionOptions = {}): Extension
 			);
 			if (pendingServers.length === 0) return;
 			let waiting: McpServer[] = [];
-			if (isCodemodeTool(tool)) {
-				const { code } = event.input as { code?: unknown };
-				const source = typeof code === "string" ? code : "";
-				waiting = pendingServers.filter((server) => scriptNeedsServer(source, server.entry.name));
-			} else if (isToolSearchTool(tool) || RESOURCE_TOOL_NAMES.has(tool.name)) {
+			if (isToolSearchTool(tool) || RESOURCE_TOOL_NAMES.has(tool.name)) {
 				waiting = pendingServers;
 			}
 			await waitForServers(waiting, ctx.signal);

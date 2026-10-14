@@ -179,6 +179,19 @@ describe("tool declarations", () => {
 });
 
 describe("renderDeclarations", () => {
+	it("renders nested host namespaces", () => {
+		expect(
+			renderDeclarations({
+				globals: [
+					{ name: "host.fs.read", execute },
+					{ name: "host.fs.write", execute },
+					{ name: "host.clock.now", execute },
+				],
+			}),
+		).toBe(
+			"declare const host: {\n  fs: {\n    read(args: unknown): Promise<unknown>;\n    write(args: unknown): Promise<unknown>;\n  };\n  clock: {\n    now(args: unknown): Promise<unknown>;\n  };\n};",
+		);
+	});
 	it("renders tools and globals", () => {
 		const text = renderDeclarations({
 			tools: [

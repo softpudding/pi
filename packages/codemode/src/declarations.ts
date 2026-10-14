@@ -111,7 +111,10 @@ export function renderDeclarations(options: RenderDeclarationsOptions): string {
 		);
 		sections.push(`declare const tools: {\n${members.join("\n")}\n};`);
 	}
-	const namespaces = new Map<string, string[]>();
+	interface Namespace {
+		members: Map<string, Namespace | CodemodeTool>;
+	}
+	const namespaces = new Map<string, Namespace>();
 	for (const global of options.globals ?? []) {
 		const dot = global.name.indexOf(".");
 		if (dot === -1) {
@@ -119,12 +122,30 @@ export function renderDeclarations(options: RenderDeclarationsOptions): string {
 			continue;
 		}
 		const namespace = global.name.slice(0, dot);
-		const members = namespaces.get(namespace) ?? [];
-		if (members.length === 0) namespaces.set(namespace, members);
-		members.push(renderGlobal(global.name.slice(dot + 1), global, INDENT));
+		let current: Namespace = namespaces.get(namespace) ?? { members: new Map() };
+		namespaces.set(namespace, current);
+		const path = global.name.slice(dot + 1).split(".");
+		for (const part of path.slice(0, -1)) {
+			let child: Namespace | CodemodeTool | undefined = current.members.get(part);
+			if (!child) {
+				child = { members: new Map() };
+				current.members.set(part, child);
+			}
+			if (!("members" in child)) throw new Error(`Conflicting global namespace: ${global.name}`);
+			current = child;
+		}
+		current.members.set(path.at(-1)!, global);
 	}
+	const renderNamespace = (namespace: Namespace, indent: string): string =>
+		[...namespace.members]
+			.map(([name, value]) =>
+				"members" in value
+					? `${indent}${name}: {\n${renderNamespace(value, indent + INDENT)}\n${indent}};`
+					: renderGlobal(name, value, indent),
+			)
+			.join("\n");
 	for (const [namespace, members] of namespaces) {
-		sections.push(`declare const ${namespace}: {\n${members.join("\n")}\n};`);
+		sections.push(`declare const ${namespace}: {\n${renderNamespace(members, INDENT)}\n};`);
 	}
 	return sections.join("\n\n");
 }
