@@ -12,7 +12,7 @@ import type {
 	CodemodeStoreWrites,
 	CodemodeTool,
 } from "../types.ts";
-import { type CodemodeWasmModule, loadQuickJSWasm } from "../wasm.ts";
+import { type CodemodeWasmModule, loadQuickJSEncoding, loadQuickJSWasm } from "../wasm.ts";
 import {
 	type HostToWorkerMessage,
 	isWorkerToHostMessage,
@@ -27,12 +27,14 @@ const RESERVED_GLOBALS: ReadonlySet<string> = new Set([
 	"ALL_TOOLS",
 	"console",
 	"text",
+	"observe",
 	"image",
 	"exit",
 	"globalThis",
 	"store",
 	"load",
 	"loop",
+	"data",
 ]);
 
 function errorMessage(error: unknown): string {
@@ -109,6 +111,7 @@ interface PendingCall {
 
 interface ExecutionOptions {
 	code: string;
+	data: string | undefined;
 	module?: CodemodeExecuteOptions["module"];
 	tools: ReadonlyMap<string, CodemodeTool>;
 	globals: ReadonlyMap<string, CodemodeTool>;
@@ -117,6 +120,7 @@ interface ExecutionOptions {
 	memoryLimitBytes: number | undefined;
 	store: Record<string, string>;
 	wasm: Promise<CodemodeWasmModule>;
+	encodingWasm: Promise<CodemodeWasmModule>;
 	workerUrl: string | URL;
 }
 
@@ -161,8 +165,8 @@ class Execution {
 			}
 		}
 
-		options.wasm.then(
-			(wasm) => this.start(options, wasm),
+		Promise.all([options.wasm, options.encodingWasm]).then(
+			([wasm, encodingWasm]) => this.start(options, wasm, encodingWasm),
 			(error: unknown) => {
 				this.finish({ kind: "sandbox", message: `Failed to load QuickJS: ${errorMessage(error)}` });
 			},
@@ -174,10 +178,11 @@ class Execution {
 		return this.promise;
 	}
 
-	private start(options: ExecutionOptions, wasm: CodemodeWasmModule): void {
+	private start(options: ExecutionOptions, wasm: CodemodeWasmModule, encodingWasm: CodemodeWasmModule): void {
 		if (this.finished) return;
 		const workerData: WorkerData = {
 			code: options.code,
+			data: options.data,
 			module: options.module,
 			tools: [...options.tools.values()].map((tool) => ({
 				name: tool.name,
@@ -189,6 +194,7 @@ class Execution {
 				spread: global.spread === true,
 			})),
 			wasm,
+			encodingWasm,
 			memoryLimitBytes: options.memoryLimitBytes,
 			store: options.store,
 			interrupt: this.interrupt,
@@ -240,6 +246,16 @@ class Execution {
 		if (this.finished) return;
 		if (!isWorkerToHostMessage(message)) throw new BridgeError("unknown message from the worker");
 		switch (message.type) {
+			case "observation": {
+				const snapshot = parseBridgeJson(message.json, "observation");
+				if (typeof snapshot !== "object" || snapshot === null || Array.isArray(snapshot))
+					throw new BridgeError("observation is not an object");
+				const { value, view } = snapshot as { value?: unknown; view?: unknown };
+				if (view !== undefined && typeof view !== "string")
+					throw new BridgeError("observation view is not a string");
+				this.output.push({ type: "observation", value, ...(view === undefined ? {} : { view }) });
+				break;
+			}
 			case "output":
 				this.output.push(message.item);
 				break;
@@ -334,17 +350,23 @@ class Execution {
 			return;
 		}
 		Atomics.store(new Int32Array(this.interrupt), 0, 1);
+		// Bun binaries can drop the worker's last handle before terminate() settles.
+		// Keep shutdown referenced so startup callers receive their result before process exit.
+		const shutdownHandle = setInterval(() => {}, 60_000);
 		this.worker
 			.terminate()
 			.catch(() => undefined)
-			.then(() => this.resolveResult(result));
+			.then(() => {
+				clearInterval(shutdownHandle);
+				this.resolveResult(result);
+			});
 	}
 }
 
 /**
  * Runs JavaScript in a QuickJS VM (a separate wasm instance) inside a worker
  * thread. The script sees `tools.<name>(args)` for every registered tool, `ALL_TOOLS`,
- * the output helpers `text`, `image`, `exit`, and `console.*`, `store`/`load`, and the
+ * the output helpers `text`, `observe`, `image`, `exit`, and `console.*`, `store`/`load`, and the
  * configured globals; nothing else (no timers, `fetch`, `process`, `require`, modules).
  *
  * Each `execute()` gets its own worker and VM; the sandbox only holds the tool
@@ -356,6 +378,7 @@ export class CodemodeSandbox {
 	private readonly timeoutMs: number;
 	private readonly memoryLimitBytes: number | undefined;
 	private readonly wasm: CodemodeWasmModule | Promise<CodemodeWasmModule> | undefined;
+	private readonly encodingWasm: CodemodeWasmModule | Promise<CodemodeWasmModule> | undefined;
 	private readonly workerUrl: string | URL;
 	private readonly running = new Set<Execution>();
 	private closed = false;
@@ -364,6 +387,7 @@ export class CodemodeSandbox {
 		this.timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
 		this.memoryLimitBytes = options.memoryLimitBytes;
 		this.wasm = options.wasm;
+		this.encodingWasm = options.encodingWasm;
 		this.workerUrl = options.workerUrl ?? defaultWorkerUrl();
 		for (const tool of options.tools ?? []) this.registerTool(tool);
 		const namespaces = new Set<string>();
@@ -408,6 +432,7 @@ export class CodemodeSandbox {
 		if (this.closed) return Promise.reject(new Error("Sandbox is closed"));
 		const execution = new Execution({
 			code,
+			data: JSON.stringify(options.data),
 			module: options.module,
 			tools: new Map(this.toolsByName),
 			globals: this.globalsByName,
@@ -416,6 +441,7 @@ export class CodemodeSandbox {
 			memoryLimitBytes: this.memoryLimitBytes,
 			store: serializeStore(options.store),
 			wasm: this.wasm === undefined ? loadQuickJSWasm() : Promise.resolve(this.wasm),
+			encodingWasm: this.encodingWasm === undefined ? loadQuickJSEncoding() : Promise.resolve(this.encodingWasm),
 			workerUrl: this.workerUrl,
 		});
 		this.running.add(execution);

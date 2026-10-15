@@ -872,6 +872,7 @@ function findProjectedCutPoint(
 export function prepareCompaction(
 	pathEntries: SessionEntry[],
 	settings: CompactionSettings,
+	firstKeptId?: string,
 ): CompactionPreparation | undefined {
 	if (pathEntries.length > 0 && pathEntries[pathEntries.length - 1].type === "compaction") {
 		return undefined;
@@ -896,6 +897,16 @@ export function prepareCompaction(
 	const boundaryEnd = projectedEntries.length;
 	const tokensBefore = estimateProjectedContextTokens(projection, pathEntries).tokens;
 	const cutPoint = findProjectedCutPoint(projectedEntries, boundaryStart, boundaryEnd, settings.keepRecentTokens);
+	if (firstKeptId !== undefined) {
+		const index = projectedEntries.findIndex((entry) => entry.sourceEntry.id === firstKeptId);
+		if (index < boundaryStart || !projectedEntries[index]?.messages.some(isCutPointMessage))
+			throw new Error(`Invalid compaction cut: ${firstKeptId}`);
+		cutPoint.firstKeptEntryIndex = index;
+		cutPoint.turnStartIndex = isProjectedTurnStart(projectedEntries[index])
+			? -1
+			: findProjectedTurnStartIndex(projectedEntries, index, boundaryStart);
+		cutPoint.isSplitTurn = cutPoint.turnStartIndex !== -1;
+	}
 
 	const firstKeptEntry = projectedEntries[cutPoint.firstKeptEntryIndex]?.sourceEntry;
 	if (!firstKeptEntry?.id) return undefined;
@@ -938,6 +949,25 @@ export function prepareCompaction(
 // ============================================================================
 // Main compaction function
 // ============================================================================
+
+/** Legal, indivisible message groups for editable selection policies. */
+export function getCompactionGroups(
+	entries: SessionEntry[],
+): Array<{ id: string; tokens: number; messages: AgentMessage[] }> {
+	const projection = buildSessionProjection(entries);
+	const groups: Array<{ id: string; tokens: number; messages: AgentMessage[] }> = [];
+	for (const entry of projection.entries) {
+		if (entry.sourceEntry.type === "compaction" || entry.messages.length === 0) continue;
+		const messages = entry.messages.filter((message) => message.role !== "system");
+		if (messages.some(isCutPointMessage)) groups.push({ id: entry.sourceEntry.id, tokens: 0, messages: [] });
+		const group = groups.at(-1);
+		if (group) {
+			group.messages.push(...messages);
+			group.tokens += messages.reduce((sum, message) => sum + estimateTokens(message), 0);
+		}
+	}
+	return groups;
+}
 
 const TURN_PREFIX_SUMMARIZATION_PROMPT = `The messages above are earlier context from an ongoing conversation. Later messages are stored separately and do not need to be reconstructed.
 

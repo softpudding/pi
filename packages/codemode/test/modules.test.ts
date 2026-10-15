@@ -41,6 +41,35 @@ describe("module programs and nested host namespaces", () => {
 			await sandbox.close();
 		}
 	});
+	it("keeps the caller's source location when an awaited host operation fails", async () => {
+		const sandbox = new CodemodeSandbox({
+			globals: [
+				{
+					name: "host.fs.read",
+					execute: () => {
+						throw new Error("read failed");
+					},
+				},
+			],
+		});
+		try {
+			const result = await sandbox.execute(
+				'export async function run() {\n  await Promise.resolve();\n  return await host.fs.read({path:"missing"});\n}',
+				{ module: { export: "run", filename: "modules/example.mjs@r-test" } },
+			);
+			expect(result).toMatchObject({
+				ok: false,
+				error: { message: "read failed", stack: expect.stringContaining("modules/example.mjs@r-test:3:") },
+			});
+			const script = await sandbox.execute('await Promise.resolve();\nawait host.fs.read({path:"missing"});');
+			expect(script).toMatchObject({
+				ok: false,
+				error: { message: "read failed", stack: expect.stringContaining("codemode.js:2:") },
+			});
+		} finally {
+			await sandbox.close();
+		}
+	});
 	it("freezes nested namespaces and rejects colliding paths", async () => {
 		expect(
 			() =>

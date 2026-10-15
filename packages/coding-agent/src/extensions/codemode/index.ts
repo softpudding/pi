@@ -7,11 +7,10 @@
 
 import type { ExtensionAPI, ExtensionContext, ExtensionFactory } from "../../core/extensions/types.ts";
 import { loadCodemodeExecutor } from "./execute.lazy.ts";
-import type { CodemodeRuntime } from "./runtime.ts";
+import type { CodemodeRuntime, HarnessLoopOutcome } from "./runtime.ts";
 import { CODEMODE_TOOL_NAME, type CodemodeToolDetails, createCodemodeToolDefinition, isCodemodeTool } from "./tool.ts";
 
 export const CODEMODE_LOOP_REMINDER_TYPE = "codemode-loop-reminder";
-const MAX_LOOP_CORRECTIONS = 3;
 
 export interface CodemodeExtensionOptions {
 	/** Activate codemode by default. SDK users may opt out and select their own initial tools. */
@@ -28,23 +27,43 @@ export function createCodemodeExtension(options: CodemodeExtensionOptions = {}):
 	return (pi) => {
 		let runtime: Promise<CodemodeRuntime> | undefined;
 		const getRuntime = async (ctx: ExtensionContext) => {
-			runtime ??= loadCodemodeExecutor().then((module) => new module.CodemodeRuntime(pi));
+			runtime ??= loadCodemodeExecutor().then((module) => new module.CodemodeRuntime(pi, options.models ?? true));
 			const current = await runtime;
-			current.sync(ctx);
+			await current.sync(ctx);
 			return current;
 		};
 		pi.on("session_start", async (_event, ctx) => {
 			if (isCodemodeActive(pi)) await getRuntime(ctx);
 		});
 		pi.on("session_tree", async (_event, ctx) => {
-			if (runtime) (await runtime).sync(ctx);
+			if (runtime) await (await runtime).sync(ctx);
 		});
 		pi.on("session_shutdown", async () => {
 			if (runtime) (await runtime).close();
 		});
-		let corrections = 0;
+		pi.registerCommand("harness", {
+			description: "Inspect Harness versions or recover: /harness restore <revision|initial>",
+			handler: async (args, ctx) => {
+				const current = await getRuntime(ctx);
+				const [command, revision] = args.trim().split(/\s+/);
+				if (command === "restore" && revision) {
+					if (!ctx.isIdle()) throw new Error("Wait for the current invocation before restoring the Harness");
+					await current.harness.recover(revision, ctx);
+				} else if (command && command !== "status")
+					throw new Error("Usage: /harness status | /harness restore <revision|initial>");
+				ctx.ui.notify(
+					JSON.stringify({
+						activeRevision: current.harness.activeRevision,
+						requestRevision: current.harness.requestRevision,
+						pending: current.harness.pending,
+					}),
+					"info",
+				);
+			},
+		});
+		let loopState: Record<string, unknown> = {};
 		pi.on("agent_start", () => {
-			corrections = 0;
+			loopState = {};
 		});
 		pi.on("tool_call", (event, ctx) => {
 			if (event.parentToolCallId !== undefined || !isCodemodeActive(pi)) return;
@@ -70,38 +89,85 @@ export function createCodemodeExtension(options: CodemodeExtensionOptions = {}):
 				return {
 					block: true,
 					reason:
-						"Only codemode is available. Define and register your own tools with host primitives, then call them through host.tools.call.",
+						"Only codemode is available. Define your own tools as Harness files, activate them, then call them through host.tools.call.",
 				};
 			}
 		});
-		pi.on("turn_end", (event, ctx) => {
-			if (event.outcome !== "completed" || ctx.signal?.aborted || !isCodemodeActive(pi)) {
+		pi.on("turn_end", async (event, ctx) => {
+			if (
+				event.outcome !== "completed" ||
+				event.message.role !== "assistant" ||
+				ctx.signal?.aborted ||
+				!isCodemodeActive(pi)
+			) {
 				return;
 			}
-			const controlled = event.toolResults.some((result) => {
-				const control = (result.details as Partial<CodemodeToolDetails> | undefined)?.loopControl;
-				return (
-					result.toolName === CODEMODE_TOOL_NAME && !result.isError && (control === "next" || control === "finish")
-				);
+			const toolCalls = event.message.content
+				.filter((part) => part.type === "toolCall")
+				.map(({ id, name }) => ({ id, name }));
+			const results: HarnessLoopOutcome["results"] = event.toolResults.map((result) => {
+				const details = result.details as Partial<CodemodeToolDetails> | undefined;
+				return {
+					toolCallId: result.toolCallId,
+					toolName: result.toolName,
+					isError: result.isError,
+					loopControl: details?.loopControl,
+					error: result.isError
+						? (details?.error ?? {
+								kind: "host",
+								message: result.content
+									.filter((p) => p.type === "text")
+									.map((p) => p.text)
+									.join("\n"),
+							})
+						: undefined,
+					calls: details?.calls ?? [],
+				};
 			});
-			if (controlled) {
-				corrections = 0;
-				return;
-			}
-
-			const exhausted = corrections >= MAX_LOOP_CORRECTIONS;
+			const controller = results.find((result) => result.toolName === CODEMODE_TOOL_NAME);
+			const finalText = event.message.content
+				.filter((part) => part.type === "text")
+				.map((part) => part.text)
+				.join("\n");
+			const assistantFinish =
+				toolCalls.length === 0 && event.message.stopReason === "stop" && finalText.trim() !== "";
+			const outcome: HarnessLoopOutcome = {
+				status:
+					toolCalls.length > 1
+						? "invalid_batch"
+						: toolCalls.some((call) => call.name !== CODEMODE_TOOL_NAME)
+							? "invalid_tool"
+							: controller?.isError
+								? "execution_failed"
+								: controller?.loopControl === "next" || controller?.loopControl === "finish"
+									? controller.loopControl
+									: assistantFinish
+										? "assistant_finish"
+										: "missing_decision",
+				...(assistantFinish ? { text: finalText } : {}),
+				toolCalls,
+				results,
+			};
+			const decision = await (await getRuntime(ctx)).decideLoop(outcome, loopState, ctx);
+			loopState = decision.state;
+			if (decision.action === "accept") return;
+			const exhausted = decision.action === "stop";
 			if (exhausted) ctx.abort();
-			else corrections++;
 			return {
 				entries: [
 					{
 						type: "custom_message" as const,
 						customType: CODEMODE_LOOP_REMINDER_TYPE,
-						content: exhausted
-							? "Loop control protocol error: no valid codemode loop decision after three corrections. The run was stopped, not successfully finished."
-							: "You did not correctly control the agent loop with codemode. Your response has not finished the task. Call codemode exactly once, with no sibling top-level tool calls, and return loop.next(results) to continue, or return loop.finish(answer) to finish. If you already have the answer, use return loop.finish(answer) now; do not repeat completed tool actions. Prior messages and results remain in context.",
+						content: decision.text ?? "",
 						display: true,
-						details: { attempt: corrections, exhausted },
+						details: {
+							outcome,
+							state: loopState,
+							exhausted,
+							revision: decision.revision,
+							reminder: decision.reminder,
+							role: "user",
+						},
 					},
 				],
 				continue: !exhausted,

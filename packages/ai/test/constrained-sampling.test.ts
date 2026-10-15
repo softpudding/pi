@@ -3,6 +3,8 @@ import { Type } from "typebox";
 import { describe, expect, it } from "vitest";
 import {
 	appendGrammarToolInputJsonDelta,
+	createGrammarToolInputProperties,
+	getGrammarToolInput,
 	makeStrictJsonSchema,
 	resolveJsonSchemaStrictSampling,
 } from "../src/api/constrained-sampling.ts";
@@ -87,6 +89,66 @@ function captureToolCallEvents(stream: AssistantMessageEventStream): {
 }
 
 describe("constrained tool sampling", () => {
+	it("supports optional raw input alongside structured arguments without losing replay data", () => {
+		const tool = makeTool({
+			parameters: Type.Object({
+				code: Type.Optional(Type.String()),
+				data: Type.Optional(Type.Object({ source: Type.String() })),
+				finish: Type.Optional(Type.String()),
+			}),
+			constrainedSampling: {
+				type: "grammar",
+				variants: { openai_lark: "start: /[\\s\\S]+/" },
+				inputProperty: "code",
+				allowJsonInput: true,
+			},
+		});
+		const properties = createGrammarToolInputProperties([tool], true);
+		expect(properties.get(tool.name)).toBe("code");
+		expect(convertResponsesTools([tool], { supportsOpenAIGrammarTools: true })[0]).toMatchObject({ type: "custom" });
+		expect(convertResponsesTools([tool], { supportsOpenAIGrammarTools: false })[0]).toMatchObject({
+			type: "function",
+			parameters: tool.parameters,
+		});
+		const source = '"quotes" `ticks` \\n\r\n中文';
+		const code = "observe(data.source);return loop.next();";
+		const argumentSets: ToolCall["arguments"][] = [{ code }, { code, data: { source } }, { finish: source }];
+		for (const args of argumentSets) {
+			const input = getGrammarToolInput(tool.name, args, "code", tool.constrainedSampling);
+			if ("data" in args || "finish" in args) expect(JSON.parse(input)).toEqual(args);
+			else expect(input).toBe(code);
+			const context = normalizeContext({
+				tools: [tool],
+				messages: [
+					{
+						...makeOutput(),
+						stopReason: "toolUse",
+						content: [{ type: "toolCall", id: "call_1|ctc_1", name: tool.name, arguments: args }],
+					},
+				],
+			});
+			expect(
+				convertResponsesMessages(makeModel(), context, new Set(["openai"]), {
+					grammarToolInputProperties: properties,
+				}),
+			).toContainEqual(expect.objectContaining({ type: "custom_tool_call", input }));
+		}
+		expect(() =>
+			createGrammarToolInputProperties(
+				[
+					{
+						...tool,
+						constrainedSampling: {
+							type: "grammar",
+							variants: { openai_lark: "start: /.+/" },
+							inputProperty: "missing",
+						},
+					},
+				],
+				true,
+			),
+		).toThrow("properties entry");
+	});
 	it("converts supported constraints and falls back when unsupported", () => {
 		expect(
 			convertResponsesTools([makeTool({ constrainedSampling: { type: "json_schema", strict: "prefer" } })])[0],

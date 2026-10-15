@@ -43,10 +43,12 @@ export interface CodemodeTool {
 /**
  * One item of the script's output, in the order the script produced it: `text()` and `console.*`
  * produce text items, with `console: true` for `console.*`, and `image()` image items. `data` is base64.
+ * `observe()` snapshots structured data for the host's presentation rules; it does not format it.
  */
 export type CodemodeOutputItem =
 	| { type: "text"; text: string; console?: true }
-	| { type: "image"; data: string; mimeType: string };
+	| { type: "image"; data: string; mimeType: string }
+	| { type: "observation"; value: unknown; view?: string };
 
 export type CodemodeCallStatus = "ok" | "error" | "cancelled";
 
@@ -102,7 +104,7 @@ export interface CodemodeSandboxOptions {
 	 * Functions exposed as top-level identifiers instead of on `tools`, for host helpers such as
 	 * attaching an image to the result. They behave like tools (JSON round trip, promise result)
 	 * but are not recorded in `result.calls`. Names must be identifiers and may not shadow the
-	 * built-in globals (`tools`, `ALL_TOOLS`, `console`, `text`, `image`, `exit`, `store`, `load`, `loop`).
+	 * built-in globals (`tools`, `ALL_TOOLS`, `console`, `text`, `observe`, `image`, `exit`, `store`, `load`, `loop`, `data`).
 	 */
 	globals?: CodemodeTool[];
 	/**
@@ -122,6 +124,8 @@ export interface CodemodeSandboxOptions {
 	 * is not on disk, for example in a Bun compiled executable.
 	 */
 	wasm?: CodemodeWasmModule | Promise<CodemodeWasmModule>;
+	/** Compiled text encoding extension. Default: loadQuickJSEncoding() from quickjs-wasi/encoding.so. */
+	encodingWasm?: CodemodeWasmModule | Promise<CodemodeWasmModule>;
 	/**
 	 * Worker entry that imports `@earendil-works/pi-codemode/worker`. Default: this package's own
 	 * worker file. Pass it when this package is bundled, since the default is resolved relative to
@@ -133,6 +137,8 @@ export interface CodemodeSandboxOptions {
 
 export interface CodemodeExecuteOptions {
 	signal?: AbortSignal;
+	/** JSON data exposed as the outer `data` binding, separate from executable source. */
+	data?: unknown;
 	/** Overrides the sandbox default for this execution. */
 	timeoutMs?: number;
 	/**

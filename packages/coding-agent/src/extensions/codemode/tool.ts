@@ -1,15 +1,15 @@
 /** Codemode exposes primitives and model-owned programs, never the prebuilt tool catalog. */
 import { join } from "node:path";
 import type { AgentTool } from "@earendil-works/pi-agent-core";
-import type { CodemodeLoopControl } from "@earendil-works/pi-codemode";
+import type { CodemodeError, CodemodeLoopControl } from "@earendil-works/pi-codemode";
 import { CODEMODE_SOURCE_GRAMMAR } from "@earendil-works/pi-codemode/source";
 import { type Static, Type } from "typebox";
 import { getDocsPath } from "../../config.ts";
 import type { ExtensionContext, ToolDefinition, ToolInfo } from "../../core/extensions/types.ts";
 import type { ModelRegistry } from "../../core/model-registry.ts";
 import { wrapToolDefinition } from "../../core/tools/tool-definition-wrapper.ts";
-import { ATOMIC_CODEMODE_API } from "./api.ts";
 import { loadCodemodeExecutor } from "./execute.lazy.ts";
+import { attachHarnessRuntime } from "./harness/bridge.ts";
 import { codemodeRenderers } from "./renderer.ts";
 import type { CodemodeRuntime } from "./runtime.ts";
 
@@ -31,8 +31,29 @@ export interface CodemodeToolOptions {
 	getRuntime?: (ctx: ExtensionContext) => Promise<CodemodeRuntime>;
 }
 
-export const codemodeSchema = Type.Object({ code: Type.String({ description: "Raw JavaScript source." }) });
+export const codemodeSchema = Type.Object({
+	code: Type.Optional(Type.String()),
+	data: Type.Optional(Type.Record(Type.String(), Type.Unknown())),
+	finish: Type.Optional(Type.String()),
+});
 export type CodemodeToolInput = Static<typeof codemodeSchema>;
+
+/** Custom-tool input is carried in code by the provider adapter. Decode one explicit JSON object only. */
+export function prepareCodemodeArguments(input: unknown): CodemodeToolInput {
+	if (!input || typeof input !== "object" || Array.isArray(input)) return input as CodemodeToolInput;
+	const args = input as Record<string, unknown>;
+	if (Object.keys(args).length !== 1 || typeof args.code !== "string") return args as CodemodeToolInput;
+	// A quoted property at the start of a block cannot be a JavaScript statement.
+	// Leave ordinary JS blocks, expressions, and all document strings untouched.
+	if (!/^\s*\{\s*"(?:[^"\\]|\\.)*"\s*:/.test(args.code)) return args as CodemodeToolInput;
+	try {
+		return JSON.parse(args.code) as CodemodeToolInput;
+	} catch {
+		throw new Error(
+			"Invalid codemode JSON envelope: expected a valid object containing {code,data?} or {finish}. No operations were executed.",
+		);
+	}
+}
 export function isCodemodeTool(tool: Pick<ToolInfo, "name" | "parameters">): boolean {
 	return tool.name === CODEMODE_TOOL_NAME && tool.parameters === codemodeSchema;
 }
@@ -46,36 +67,23 @@ export interface CodemodeNestedCall {
 	durationMs?: number;
 	error?: string;
 	cost?: number;
+	effect?: { domain: "task" | "harness"; operation: "read" | "write" | "edit"; path: string };
 }
 export interface CodemodeToolDetails {
 	calls: CodemodeNestedCall[];
 	loopControl?: CodemodeLoopControl;
+	error?: CodemodeError | { kind: "presentation"; message: string };
 	fullOutputPath?: string;
 }
 
-export const codemodeToolSystemPromptContribution = {
-	snippet: "Build and run your own tools from host primitives",
-	guidelines: [
-		"Use exactly one codemode call per response, with no sibling top-level tool calls. Batch independent operations inside that script with Promise.allSettled.",
-		"Every external operation must use a model-authored registered tool: write its JavaScript export, await host.modules.put, await host.tools.register, then await host.tools.call. Put host.fs/process/streams operations inside that export. Do not skip registration by calling these primitives directly in the controller script. No prebuilt tools are available.",
-		"When a task requires understanding new external data, return the tool's data with loop.next so you can read it on the next inference. Then compose the requested explanation or decision and return it with loop.finish. Code cannot use your reasoning on data you have not yet observed. Raw source data alone does not satisfy a request to analyze or explain it.",
-		"End every script with return loop.next(results) to continue, or return loop.finish(answer) to finish. Even a text-only answer must use loop.finish, not a standalone assistant response.",
-	],
-} as const;
-
 export function createCodemodeDescription(): string {
-	return `Run JavaScript as the body of an async function in a QuickJS sandbox. Input is raw source, not JSON or a markdown fence. Top-level await and return work. No Node, filesystem, network, or timers except through the documented host interfaces.
-Optional first line: // @options: {"max_output_tokens": 10000, "timeout_ms": 60000}
-
-Loop control is required: make exactly one codemode call, with no other top-level tools, then return loop.next(results) to append results and request another inference, or return loop.finish(answer) to deliver the final answer without another inference. Previous context is preserved. Plain return, text(), exit(), or a standalone assistant answer does not select a loop decision. Multiple top-level calls are rejected before any side effect.
-
-${ATOMIC_CODEMODE_API}`;
+	return "Execute JavaScript with host primitives and Harness-defined tools. The active Harness generates request-specific instructions from agent.yaml.";
 }
 
 export function createCodemodeToolDefinition(
 	options: CodemodeToolOptions = {},
 ): ToolDefinition<typeof codemodeSchema, CodemodeToolDetails | undefined> {
-	return {
+	const definition: ToolDefinition<typeof codemodeSchema, CodemodeToolDetails | undefined> = {
 		name: CODEMODE_TOOL_NAME,
 		label: CODEMODE_TOOL_NAME,
 		description:
@@ -83,8 +91,7 @@ export function createCodemodeToolDefinition(
 			(options.models
 				? `\n\nModel primitives (also available in module callbacks): \`models\`: classifiers and image generation. Async APIs: models.getAvailableOfType(type, provider?), models.getModelsOfType(type, provider?), models.getModelOfType(type, provider, id), models.classify(model, context), models.generateImages(model, context). Types: "chat", "classifier", "image". Model calls resolve catalog credentials on the host; scripts select a model by provider and id. API reference: ${CODEMODE_DOCS_PATH}.`
 				: ""),
-		promptSnippet: codemodeToolSystemPromptContribution.snippet,
-		promptGuidelines: [...codemodeToolSystemPromptContribution.guidelines],
+		promptSnippet: "Build and run your own tools from host primitives",
 		parameters: codemodeSchema,
 		exposure: "model-only",
 		prepareLoadout: (loadout) => ({
@@ -92,11 +99,19 @@ export function createCodemodeToolDefinition(
 				.filter((tool) => tool.name !== CODEMODE_TOOL_NAME)
 				.map((tool) => tool.name),
 		}),
-		constrainedSampling: { type: "grammar", variants: { openai_lark: CODEMODE_SOURCE_GRAMMAR } },
+		constrainedSampling: {
+			type: "grammar",
+			variants: { openai_lark: CODEMODE_SOURCE_GRAMMAR },
+			inputProperty: "code",
+			allowJsonInput: true,
+		},
+		prepareArguments: prepareCodemodeArguments,
 		execute: async (toolCallId, params, signal, onUpdate, ctx) =>
 			(await loadCodemodeExecutor()).executeCodemode(toolCallId, params, signal, onUpdate, ctx, options),
 		...codemodeRenderers,
 	};
+	if (options.getRuntime) attachHarnessRuntime(definition, options.getRuntime);
+	return definition;
 }
 
 export function createCodemodeTool(options: CodemodeToolOptions = {}): AgentTool<typeof codemodeSchema> {

@@ -32,6 +32,17 @@ function textOf(result: AgentToolResult<unknown>): string {
 		.join("\n");
 }
 
+/** This example owns presentation; the sandbox keeps observations as data. */
+function renderObservation(value: unknown, path = "$"): string {
+	if (value !== null && typeof value === "object") {
+		return [
+			`${path} (${Array.isArray(value) ? "array" : "object"})`,
+			...Object.entries(value).map(([key, child]) => renderObservation(child, `${path}[${JSON.stringify(key)}]`)),
+		].join("\n\n");
+	}
+	return `${path} (${value === null ? "null" : typeof value}):\n${String(value)}`;
+}
+
 /**
  * One `AgentTool` per tool of a connected MCP server, named `<prefix>_<tool>`. Tools with an MCP
  * output schema declare it as `outputSchema` and return `structuredContent`, which codemode scripts
@@ -142,7 +153,7 @@ export function createCodemodeTool(
 		description: [
 			"Run JavaScript that calls other tools, to chain calls, run them in parallel, or filter large results.",
 			"The code is the body of an async function. There is no Node, file system, network, or timers.",
-			"Call tools as `await tools.<name>(args)`. Output with `text(value)` or `console.log()`, or `return` a value.",
+			"Call tools as `await tools.<name>(args)`. Show structured data with `observe(value)`; strings remain literal text. Use `text(value)`, `console.log()`, or `return` for other output.",
 			"Only the output and the return value reach you, not the results of the tool calls.",
 			"",
 			"```ts",
@@ -154,8 +165,10 @@ export function createCodemodeTool(
 			const sandbox = new CodemodeSandbox({ tools: sandboxTools, timeoutMs: 120_000 });
 			try {
 				const result = await sandbox.execute(params.code, { signal });
-				// Items from text(), console.*, and image(), in order. They have pi-ai's content shapes.
-				const content: (TextContent | ImageContent)[] = [...result.output];
+				// Adapt observation data into model content; text and image items already have pi-ai shapes.
+				const content: (TextContent | ImageContent)[] = result.output.map((item) =>
+					item.type === "observation" ? { type: "text", text: renderObservation(item.value) } : item,
+				);
 				if (result.ok && result.value !== undefined) {
 					const value = typeof result.value === "string" ? result.value : JSON.stringify(result.value);
 					content.push({ type: "text", text: value });

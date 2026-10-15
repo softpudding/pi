@@ -1,0 +1,1 @@
+No valid loop decision was received. For further work, call codemode once with code returning loop.next(results), without sibling top-level tool calls. For completion, provide the final answer as normal assistant text or with the finish input; code may also return loop.finish(value). Do not repeat completed tool actions. Prior messages and results remain in context.

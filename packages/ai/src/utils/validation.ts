@@ -292,6 +292,22 @@ function formatValidationPath(error: TLocalizedValidationError): string {
 	return path || "root";
 }
 
+/** Describe argument shapes without re-encoding source documents into the error text. */
+function summarizeArguments(value: unknown): string {
+	const describe = (entry: unknown): string => {
+		if (typeof entry === "string")
+			return `string (${entry.length} characters)${entry.length <= 120 ? `\n${entry}` : ""}`;
+		if (Array.isArray(entry)) return `array (${entry.length} items)`;
+		if (entry !== null && typeof entry === "object") return `object (${Object.keys(entry).length} properties)`;
+		return `${entry === null ? "null" : typeof entry}: ${String(entry)}`;
+	};
+	if (value === null || typeof value !== "object" || Array.isArray(value)) return describe(value);
+	const entries = Object.entries(value);
+	const lines = entries.slice(0, 12).map(([key, entry]) => `${key.slice(0, 80)}: ${describe(entry)}`);
+	if (entries.length > 12) lines.push(`[${entries.length - 12} additional argument fields]`);
+	return lines.join("\n") || "(empty object)";
+}
+
 /**
  * Finds a tool by name and validates the tool call arguments against its TypeBox schema
  * @param tools Array of tool definitions
@@ -338,13 +354,12 @@ export function validateToolArguments(tool: Tool, toolCall: ToolCall): any {
 		return args;
 	}
 
-	const errors =
-		validator
-			.Errors(args)
-			.map((error) => `  - ${formatValidationPath(error)}: ${error.message}`)
-			.join("\n") || "Unknown validation error";
-
-	const errorMessage = `Validation failed for tool "${toolCall.name}":\n${errors}\n\nReceived arguments:\n${JSON.stringify(toolCall.arguments, null, 2)}`;
+	const diagnostics = validator.Errors(args);
+	const errors = diagnostics
+		.slice(0, 10)
+		.map((error) => `  - ${formatValidationPath(error).slice(0, 160)}: ${error.message.slice(0, 500)}`);
+	if (diagnostics.length > 10) errors.push(`  [${diagnostics.length - 10} additional validation errors]`);
+	const errorMessage = `Validation failed for tool "${toolCall.name}":\n${errors.join("\n") || "Unknown validation error"}\n\nReceived argument summary (long text omitted):\n${summarizeArguments(toolCall.arguments)}`;
 
 	throw new Error(errorMessage);
 }

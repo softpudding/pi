@@ -1,0 +1,1 @@
+Submit JavaScript source directly, without Markdown fences or a JSON wrapper. Use ordinary JavaScript strings and objects, including when authoring source, file contents and edit text. No data input is required.

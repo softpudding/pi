@@ -7,6 +7,7 @@ import { setTimeout as delay } from "node:timers/promises";
 import type { CodemodeTool } from "@earendil-works/pi-codemode";
 import { withFileMutationQueue } from "../../core/tools/file-mutation-queue.ts";
 import { killProcessTree } from "../../utils/shell.ts";
+import { bindHostContract } from "./contracts.ts";
 
 export function object(value: unknown): Record<string, unknown> {
 	if (typeof value !== "object" || value === null || Array.isArray(value)) throw new Error("Expected an object");
@@ -137,8 +138,16 @@ export class PrimitiveScope {
 					child.once("error", () => resolveExit({ exitCode: -1, signal: null }));
 				});
 				this.processes.set(id, { child, exited });
-				if (child.stdout) this.readers.set(`${id}/stdout`, child.stdout);
-				if (child.stderr) this.readers.set(`${id}/stderr`, child.stderr);
+				for (const [name, stream] of [
+					["stdout", child.stdout],
+					["stderr", child.stderr],
+				] as const) {
+					if (!stream) continue;
+					// Keep pull mode across process exit. ChildProcess otherwise resumes unread pipes
+					// during cleanup, discarding bytes before a later streams.read can consume them.
+					stream.on("readable", () => {});
+					this.readers.set(`${id}/${name}`, stream);
+				}
 				if (child.stdin) {
 					child.stdin.on("error", () => {});
 					this.writers.set(`${id}/stdin`, child.stdin);
@@ -219,14 +228,13 @@ export class PrimitiveScope {
 				this.readers.delete(id);
 			},
 		};
-		return Object.entries(operations).map(([name, execute]) => ({
-			name,
-			execute: (args, context) => {
+		return Object.entries(operations).map(([name, execute]) =>
+			bindHostContract(name, (args, context) => {
 				if (this.closed) throw new Error("Invocation resources are closed");
 				context.signal.throwIfAborted();
 				return execute(args, context);
-			},
-		}));
+			}),
+		);
 	}
 
 	close(): void {

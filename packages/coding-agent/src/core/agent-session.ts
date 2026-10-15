@@ -13,6 +13,7 @@
  * Modes use this class and add their own I/O layer on top.
  */
 
+import { AsyncLocalStorage } from "node:async_hooks";
 import { readFileSync } from "node:fs";
 import { basename, dirname } from "node:path";
 import {
@@ -31,7 +32,7 @@ import {
 	runToolCall,
 	type ThinkingLevel,
 } from "@earendil-works/pi-agent-core";
-import { contentText, getCurrentSystemMessage, retryDelayMs } from "@earendil-works/pi-ai";
+import { contentText, getCurrentSystemMessage, normalizeContext, retryDelayMs } from "@earendil-works/pi-ai";
 import type {
 	AssistantMessage,
 	AuthResult,
@@ -55,6 +56,11 @@ import {
 	resetApiProviders,
 	streamSimple,
 } from "@earendil-works/pi-ai/compat";
+import { getDocsPath, getExamplesPath, getReadmePath } from "../config.ts";
+import { getHarnessRuntime } from "../extensions/codemode/harness/bridge.ts";
+import type { SummaryExecutor } from "../extensions/codemode/harness/compaction.ts";
+import { codemodeInputContract } from "../extensions/codemode/input.ts";
+import type { CodemodeRuntime } from "../extensions/codemode/runtime.ts";
 import { getThemeByName, theme } from "../modes/interactive/theme/theme.ts";
 import { stripFrontmatter } from "../utils/frontmatter.ts";
 import { processImage } from "../utils/image-process.ts";
@@ -70,10 +76,12 @@ import {
 	calculateContextTokens,
 	collectEntriesForBranchSummary,
 	compact,
+	completeSummarization,
 	estimateContextTokens,
 	estimateProjectedContextTokens,
 	estimateTokens,
 	generateBranchSummary,
+	getSummarizationFailure,
 	prepareCompaction,
 	shouldCompact,
 } from "./compaction/index.ts";
@@ -472,6 +480,9 @@ export class AgentSession {
 	private _toolRegistry: Map<string, AgentTool> = new Map();
 	/** Created on the first `ctx.executeTool()` call. */
 	private _nestedToolCalls: NestedToolCallRunner | undefined;
+	private readonly _harnessToolScope = new AsyncLocalStorage<AgentTool[]>();
+	private _harnessSystemPrompt?: string;
+	private _requestModel?: Model<string>;
 	/** Declared tools whose declarations requests leave out, from `prepareLoadout` hooks. */
 	private _hiddenDeclarations: ReadonlySet<string> = new Set();
 	private _toolDefinitions: Map<string, ToolDefinitionEntry> = new Map();
@@ -517,6 +528,7 @@ export class AgentSession {
 		this._installAgentBoundaryHooks();
 		this._installHiddenDeclarationsProjection();
 		this._installAgentForcedPromptProjection();
+		this._installHarnessProjection();
 
 		this._buildRuntime({
 			activeToolNames: this._initialActiveToolNames,
@@ -775,6 +787,8 @@ export class AgentSession {
 
 	private async _compactBeforeNextAssistantResponse(context: AgentContext): Promise<AgentContext> {
 		const projection = this.sessionManager.buildSessionProjection();
+		// Editable mode plans compaction against the final request and stages its checkpoint there.
+		if (await this._getEditableHarness()) return { ...context, messages: projection.messages };
 		// A virtual selection is checked in prepareRequest, against the model the request is routed to.
 		const model = this.model;
 		if (!model || isVirtualModel(model) || !this._exceedsCompactionThreshold(model, projection)) {
@@ -811,7 +825,10 @@ export class AgentSession {
 			let { previous, context, projection } = await prepare();
 			const model = previous?.model ?? this.agent.state.model;
 			const thinkingLevel = previous?.thinkingLevel ?? this.agent.state.thinkingLevel;
-			if (!isVirtualModel(model)) return { ...previous, context, model, thinkingLevel };
+			if (!isVirtualModel(model)) {
+				this._requestModel = model;
+				return { ...previous, context, model, thinkingLevel };
+			}
 
 			// The selection stays in agent state; only this request uses the routed model. A routing
 			// failure rejects, which ends the run with an error response. Only messages the user wrote
@@ -835,10 +852,11 @@ export class AgentSession {
 			}
 			// The route stands: the router already decided this request. The state entry does not change
 			// the projection.
-			if (this._exceedsCompactionThreshold(route.model, projection)) {
+			if (!(await this._getEditableHarness()) && this._exceedsCompactionThreshold(route.model, projection)) {
 				await this._runAutoCompaction("threshold", false);
 				({ previous, context } = await prepare());
 			}
+			this._requestModel = route.model;
 			return { ...previous, context, model: route.model, thinkingLevel: route.thinkingLevel };
 		};
 	}
@@ -1467,6 +1485,8 @@ export class AgentSession {
 
 	/** Current effective system prompt, including changes not yet sent to the model. */
 	get systemPrompt(): string {
+		if (this.getActiveToolNames().includes("codemode") && this._harnessSystemPrompt !== undefined)
+			return this._harnessSystemPrompt;
 		return buildSystemPrompt(this._runSystemPromptOptions ?? this._baseSystemPromptOptions);
 	}
 
@@ -1559,6 +1579,8 @@ export class AgentSession {
 	 * `codemode` or `deferred` tool.
 	 */
 	private _getCallableTools(active: ReadonlySet<string> = new Set(this.getActiveToolNames())): AgentTool[] {
+		const pinned = this._harnessToolScope.getStore();
+		if (pinned) return pinned;
 		return [...this._toolRegistry.values()].filter((tool) => {
 			const exposure = this._getToolExposure(tool.name);
 			return exposure === "codemode" || exposure === "deferred" || (exposure === "direct" && active.has(tool.name));
@@ -1797,6 +1819,198 @@ export class AgentSession {
 				timestamp: current?.timestamp ?? Date.now(),
 			};
 			return [head, ...transformed.filter((message) => message.role !== "system")];
+		};
+	}
+
+	/** Bind internal Harness calls to the existing nested executor with a pinned tool snapshot. */
+	private async _getEditableHarness(): Promise<CodemodeRuntime | undefined> {
+		if (!this.getActiveToolNames().includes("codemode")) return undefined;
+		const runtime = await getHarnessRuntime(
+			this.getToolDefinition("codemode"),
+			this._extensionRunner.createContext(),
+		);
+		runtime?.bindExecutor((parentId, name, args, tools, signal) =>
+			this._harnessToolScope.run(tools, () => this._executeNestedToolCall(parentId, name, args, { signal })),
+		);
+		return runtime;
+	}
+
+	/** Final context boundary: canonical projection, routing and native extensions have all run. */
+	private _installHarnessProjection(): void {
+		const previous = this.agent.transformContext;
+		this.agent.transformContext = async (messages, signal) => {
+			const transformed = previous ? await previous(messages, signal) : messages;
+			const runtime = await this._getEditableHarness();
+			const codemode = this.agent.state.tools.find((tool) => tool.name === "codemode");
+			if (!runtime || !codemode) return transformed;
+			const options = this._runSystemPromptOptions ?? this._baseSystemPromptOptions;
+			const model = this._requestModel ?? this.model;
+			const sources: Record<string, unknown> = {
+				"host.input-contract": codemodeInputContract(model, codemode),
+				"project.instructions": options.contextFiles,
+				"project.skills": options.skills,
+				environment: {
+					cwd: this._cwd,
+					model: model && {
+						provider: model.provider,
+						id: model.id,
+						contextWindow: model.contextWindow,
+						maxTokens: model.maxTokens,
+					},
+					docs: { readme: getReadmePath(), docs: getDocsPath(), examples: getExamplesPath() },
+					compactionSettings: this.settingsManager.getCompactionSettings(model),
+				},
+				"user.prompt-config": {
+					customPrompt: options.customPrompt,
+					appendSystemPrompt: options.appendSystemPrompt,
+					forceSystemPrompt: options.forceSystemPrompt,
+					systemSource: this._resourceLoader.getSystemPromptSource(),
+					appendSources: this._resourceLoader.getAppendSystemPromptSources(),
+				},
+				"session.history": {
+					messages: transformed,
+					entries: this.sessionManager.buildSessionProjection().entries.map((entry) => ({
+						id: entry.sourceEntry.id,
+						type: entry.sourceEntry.type,
+						messages: entry.messages,
+					})),
+				},
+				"external.contributions": {
+					sections: options.sections,
+					guidelines: options.promptGuidelines,
+					extensions: this._resourceLoader.getExtensions().extensions.map((extension) => extension.path),
+					contextBefore: messages,
+					contextAfter: transformed,
+					systemBefore: getCurrentSystemMessage(messages),
+					systemAfter: getCurrentSystemMessage(transformed),
+					ownership: "Native extension contributions remain host-owned; Harness projection runs after them.",
+				},
+			};
+			runtime.setSources(sources);
+			const preview = await runtime.previewRequest(signal);
+			const policy = await runtime.compactionPolicy(
+				this.sessionManager.getBranch(),
+				preview.estimatedTokens,
+				model?.contextWindow ?? 0,
+				true,
+				signal,
+			);
+			let checkpoint: CompactionResult | undefined;
+			let fromExtension = false;
+			let started = false;
+			try {
+				if (model && policy.plan.shouldCompact) {
+					const preparation = prepareCompaction(
+						this.sessionManager.getBranch(),
+						policy.plan,
+						policy.plan.firstKeptId,
+					);
+					if (preparation) {
+						started = true;
+						this._emit({ type: "compaction_start", reason: "threshold" });
+						const requestSignal = signal ?? new AbortController().signal;
+						const intercepted = (await this._extensionRunner.emit({
+							type: "session_before_compact",
+							preparation,
+							branchEntries: this.sessionManager.getBranch(),
+							customInstructions: undefined,
+							reason: "threshold",
+							willRetry: false,
+							signal: requestSignal,
+						})) as SessionBeforeCompactResult | undefined;
+						if (intercepted?.cancel) throw new Error("Compaction cancelled by native extension");
+						fromExtension = !!intercepted?.compaction;
+						checkpoint =
+							intercepted?.compaction ??
+							(await runtime.compact(
+								policy,
+								preparation,
+								await this._harnessSummaryExecutor(model, requestSignal, {
+									source: "compaction",
+									reason: "threshold",
+								}),
+								undefined,
+								requestSignal,
+							));
+						// Validate an extension-provided cut too, before appending any checkpoint.
+						prepareCompaction(this.sessionManager.getBranch(), policy.plan, checkpoint.firstKeptEntryId);
+						const manager = this._createBoundaryPreviewManager([{ type: "compaction", ...checkpoint }]);
+						const staged = manager.buildSessionProjection();
+						const stagedMessages = previous ? await previous(staged.messages, signal) : staged.messages;
+						sources["session.history"] = {
+							messages: stagedMessages,
+							entries: staged.entries.map((entry) => ({
+								id: entry.sourceEntry.id,
+								type: entry.sourceEntry.type,
+								messages: entry.messages,
+							})),
+						};
+						sources["external.contributions"] = {
+							...(sources["external.contributions"] as Record<string, unknown>),
+							contextBefore: staged.messages,
+							contextAfter: stagedMessages,
+							systemBefore: getCurrentSystemMessage(staged.messages),
+							systemAfter: getCurrentSystemMessage(stagedMessages),
+						};
+						runtime.setSources(sources);
+					}
+				}
+				const finalPreview = checkpoint ? await runtime.previewRequest(signal) : preview;
+				if (model && model.contextWindow > 0 && finalPreview.estimatedTokens > model.contextWindow)
+					throw new Error(
+						`Harness request exceeds estimated context capacity (${finalPreview.estimatedTokens}/${model.contextWindow}); active revision and history were preserved`,
+					);
+				const projected = await runtime.project(
+					this._extensionRunner.createContext(),
+					codemode,
+					signal,
+					checkpoint
+						? () => {
+								this.sessionManager.appendCompaction(
+									checkpoint!.summary,
+									checkpoint!.firstKeptEntryId,
+									checkpoint!.tokensBefore,
+									checkpoint!.details,
+									fromExtension,
+									checkpoint!.usage,
+								);
+								this._refreshFinalizedContext();
+							}
+						: undefined,
+				);
+				if (checkpoint) {
+					const entry = getLatestCompactionEntry(this.sessionManager.getBranch());
+					if (entry)
+						await this._extensionRunner.emit({
+							type: "session_compact",
+							compactionEntry: entry,
+							fromExtension,
+							reason: "threshold",
+							willRetry: false,
+						});
+					this._emit({
+						type: "compaction_end",
+						reason: "threshold",
+						result: checkpoint,
+						aborted: false,
+						willRetry: false,
+					});
+				}
+				const head = projected[0];
+				this._harnessSystemPrompt = head.role === "system" ? contentText(head.content, "") : undefined;
+				return projected;
+			} catch (error) {
+				if (started)
+					this._emit({
+						type: "compaction_end",
+						reason: "threshold",
+						result: undefined,
+						aborted: signal?.aborted === true,
+						willRetry: false,
+						errorMessage: String(error),
+					});
+				throw error;
+			}
 		};
 	}
 
@@ -2714,6 +2928,54 @@ export class AgentSession {
 	// Compaction
 	// =========================================================================
 
+	private async _harnessSummaryExecutor(
+		model: Model<string>,
+		signal: AbortSignal,
+		source: { source: "branchSummary" } | { source: "compaction"; reason: "manual" | "threshold" | "overflow" },
+	): Promise<SummaryExecutor> {
+		const auth = await this._getSummarizationRequestAuth(model, signal);
+		return async (input) => {
+			this.sessionManager.appendCustomEntry("codemode-harness-summary-request-v1", {
+				...input,
+				model: { provider: auth.model.provider, id: auth.model.id },
+				source,
+			});
+			const response = await completeSummarization(
+				auth.model,
+				normalizeContext({
+					systemPrompt: input.system,
+					messages: [{ role: "user", content: input.prompt, timestamp: Date.now() }],
+				}),
+				{
+					apiKey: auth.apiKey,
+					headers: auth.headers,
+					env: auth.env,
+					signal,
+					maxTokens: Math.min(input.maxTokens, auth.model.maxTokens > 0 ? auth.model.maxTokens : Infinity),
+					...(auth.thinkingLevel === "off" ? {} : { reasoning: auth.thinkingLevel }),
+				},
+				this.agent.streamFunction,
+				this.settingsManager.getRetrySettings(),
+				this._summarizationRetryCallbacks(source),
+			);
+			this.sessionManager.appendUsage(
+				"harness-summary",
+				response.provider,
+				response.model,
+				response.usage,
+				input.revision,
+			);
+			const failure = getSummarizationFailure(response, "Harness summarization");
+			if (failure) throw new Error(failure);
+			if (response.stopReason === "aborted" || signal.aborted) throw new Error("Harness summarization aborted");
+			if (response.content.some((block) => block.type === "toolCall"))
+				throw new Error("Harness summary attempted a tool call");
+			const text = contentText(response.content);
+			if (!text.trim()) throw new Error("Harness summary was empty");
+			return { text, usage: response.usage };
+		};
+	}
+
 	/** Generate Pi's built-in compaction summary for manual and automatic compaction. */
 	private async _runDefaultCompaction(
 		preparation: CompactionPreparation,
@@ -2722,6 +2984,23 @@ export class AgentSession {
 		signal: AbortSignal,
 		reason: "manual" | "threshold" | "overflow",
 	): Promise<CompactionResult> {
+		const harness = await this._getEditableHarness();
+		if (harness) {
+			const policy = await harness.compactionPolicy(
+				this.sessionManager.getBranch(),
+				preparation.tokensBefore,
+				model.contextWindow,
+				false,
+				signal,
+			);
+			return harness.compact(
+				policy,
+				preparation,
+				await this._harnessSummaryExecutor(model, signal, { source: "compaction", reason }),
+				customInstructions,
+				signal,
+			);
+		}
 		// Resolve the request only when Pi summarizes itself: routing may call models or fail.
 		const request = await this._getSummarizationRequestAuth(model, signal);
 		return compact(
@@ -2773,10 +3052,17 @@ export class AgentSession {
 				throw new Error(formatNoModelSelectedMessage());
 			}
 
-			const settings = this.settingsManager.getCompactionSettings(model);
 			const pathEntries = this.sessionManager.getBranch();
-
-			const preparation = prepareCompaction(pathEntries, settings);
+			const harness = await this._getEditableHarness();
+			const policy = await harness?.compactionPolicy(
+				pathEntries,
+				estimateProjectedContextTokens(this.sessionManager.buildSessionProjection(), pathEntries).tokens,
+				model.contextWindow,
+				false,
+				this._compactionAbortController.signal,
+			);
+			const settings = policy?.plan ?? this.settingsManager.getCompactionSettings(model);
+			const preparation = prepareCompaction(pathEntries, settings, policy?.plan.firstKeptId);
 			if (!preparation) {
 				// Check why we can't compact
 				const lastEntry = pathEntries[pathEntries.length - 1];
@@ -2948,7 +3234,14 @@ export class AgentSession {
 		skipAbortedCheck = true,
 		toolResults: AgentMessage[] = [],
 	): Promise<boolean> {
-		const settings = this.settingsManager.getCompactionSettings(this.model);
+		const harness = await this._getEditableHarness();
+		const policy = await harness?.compactionPolicy(
+			this.sessionManager.getBranch(),
+			estimateProjectedContextTokens(this.sessionManager.buildSessionProjection(), this.sessionManager.getBranch())
+				.tokens,
+			this._limitsModel()?.contextWindow ?? 0,
+		);
+		const settings = policy?.plan ?? this.settingsManager.getCompactionSettings(this.model);
 		if (!settings.enabled) return false;
 
 		// Skip if message was aborted (user cancelled) - unless skipAbortedCheck is false
@@ -3077,7 +3370,7 @@ export class AgentSession {
 		} else {
 			contextTokens = directContextTokens;
 		}
-		if (shouldCompact(contextTokens, contextWindow, settings)) {
+		if (policy ? policy.plan.shouldCompact : shouldCompact(contextTokens, contextWindow, settings)) {
 			return await this._runAutoCompaction("threshold", false);
 		}
 		return false;
@@ -3095,7 +3388,14 @@ export class AgentSession {
 	 */
 	private async _runAutoCompaction(reason: "overflow" | "threshold", willRetry: boolean): Promise<boolean> {
 		const model = this.model;
-		const settings = this.settingsManager.getCompactionSettings(model);
+		const harness = await this._getEditableHarness();
+		const policy = await harness?.compactionPolicy(
+			this.sessionManager.getBranch(),
+			estimateProjectedContextTokens(this.sessionManager.buildSessionProjection(), this.sessionManager.getBranch())
+				.tokens,
+			this._limitsModel()?.contextWindow ?? 0,
+		);
+		const settings = policy?.plan ?? this.settingsManager.getCompactionSettings(model);
 		let abortController: AbortController | undefined;
 		let started = false;
 		let fromExtension = false;
@@ -3107,7 +3407,7 @@ export class AgentSession {
 			}
 
 			const pathEntries = this.sessionManager.getBranch();
-			const preparation = prepareCompaction(pathEntries, settings);
+			const preparation = prepareCompaction(pathEntries, settings, policy?.plan.firstKeptId);
 			if (!preparation) {
 				return false;
 			}
@@ -4055,29 +4355,52 @@ export class AgentSession {
 			let summaryUsage: Usage | undefined;
 			if (options.summarize && entriesToSummarize.length > 0 && !extensionSummary) {
 				const signal = this._branchSummaryAbortController.signal;
-				const branchSummarySettings = this.settingsManager.getBranchSummarySettings();
-				const result = await generateBranchSummary(entriesToSummarize, {
-					...(await this._getSummarizationRequestAuth(this.model!, signal)),
-					signal,
-					customInstructions,
-					replaceInstructions,
-					reserveTokens: branchSummarySettings.reserveTokens,
-					streamFn: this.agent.streamFunction,
-					retry: this.settingsManager.getRetrySettings(),
-					callbacks: this._summarizationRetryCallbacks({ source: "branchSummary" }),
-				});
-				if (result.aborted) {
-					return { cancelled: true, aborted: true };
+				const harness = await this._getEditableHarness();
+				if (harness) {
+					const policy = await harness.compactionPolicy(
+						entriesToSummarize,
+						0,
+						this.model!.contextWindow,
+						false,
+						signal,
+						"branch",
+					);
+					const result = await harness.summarizeBranch(
+						policy,
+						entriesToSummarize,
+						await this._harnessSummaryExecutor(this.model!, signal, { source: "branchSummary" }),
+						customInstructions,
+						replaceInstructions,
+						signal,
+					);
+					summaryText = result.summary;
+					summaryUsage = result.usage;
+					summaryDetails = result.details;
+				} else {
+					const branchSummarySettings = this.settingsManager.getBranchSummarySettings();
+					const result = await generateBranchSummary(entriesToSummarize, {
+						...(await this._getSummarizationRequestAuth(this.model!, signal)),
+						signal,
+						customInstructions,
+						replaceInstructions,
+						reserveTokens: branchSummarySettings.reserveTokens,
+						streamFn: this.agent.streamFunction,
+						retry: this.settingsManager.getRetrySettings(),
+						callbacks: this._summarizationRetryCallbacks({ source: "branchSummary" }),
+					});
+					if (result.aborted) {
+						return { cancelled: true, aborted: true };
+					}
+					if (result.error) {
+						throw new Error(result.error);
+					}
+					summaryText = result.summary;
+					summaryUsage = result.usage;
+					summaryDetails = {
+						readFiles: result.readFiles || [],
+						modifiedFiles: result.modifiedFiles || [],
+					};
 				}
-				if (result.error) {
-					throw new Error(result.error);
-				}
-				summaryText = result.summary;
-				summaryUsage = result.usage;
-				summaryDetails = {
-					readFiles: result.readFiles || [],
-					modifiedFiles: result.modifiedFiles || [],
-				};
 			} else if (extensionSummary) {
 				summaryText = extensionSummary.summary;
 				summaryDetails = extensionSummary.details;
@@ -4190,7 +4513,16 @@ export class AgentSession {
 		for (const entry of this.sessionManager.getEntries()) {
 			if (entry.type === "usage") {
 				addUsageToTotals(usageTotals, entry.usage);
-			} else if ((entry.type === "branch_summary" || entry.type === "compaction") && entry.usage) {
+			} else if (
+				(entry.type === "branch_summary" || entry.type === "compaction") &&
+				entry.usage &&
+				!(
+					entry.details &&
+					typeof entry.details === "object" &&
+					"usageRecordedSeparately" in entry.details &&
+					entry.details.usageRecordedSeparately
+				)
+			) {
 				addUsageToTotals(usageTotals, entry.usage);
 			}
 			if (entry.type !== "message") continue;

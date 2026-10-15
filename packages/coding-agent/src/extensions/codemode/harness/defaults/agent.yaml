@@ -1,0 +1,61 @@
+format: pi-harness/v1
+context:
+  system:
+    render: rules/system.mjs#compose
+    inputs:
+      base: { file: prompts/system.prompt }
+      project: { source: project.instructions }
+      skills: { source: project.skills }
+      environment: { source: environment }
+      userPromptConfig: { source: user.prompt-config }
+      external: { source: external.contributions }
+  history:
+    render: rules/history.mjs#project
+    inputs:
+      history: { source: session.history }
+    options: { file: policies/history.yaml }
+codemode:
+  description:
+    render: rules/codemode.mjs#describe
+    inputs:
+      input:
+        render: rules/input.mjs#describe
+        inputs:
+          contract: { source: host.input-contract }
+          javascript: { file: prompts/input-javascript.prompt }
+          json: { file: prompts/input-json.prompt }
+        options: { file: policies/input.yaml }
+      guide: { file: prompts/codemode.prompt }
+      api: { source: host.api-reference }
+      views: { source: codemode.views }
+      nestedTools:
+        render: rules/catalog.mjs#render
+        inputs:
+          tools: { source: codemode.tools }
+        options: { file: policies/catalog.yaml }
+  tools:
+    definitions: [tools/*.yaml]
+  hooks:
+    definitions: []
+  output:
+    render: rules/output.mjs#render
+    options: { file: policies/output.yaml }
+    views: { file: policies/views.yaml }
+loop:
+  decide: rules/loop.mjs#decide
+  options: { file: policies/loop.yaml }
+  reminders:
+    retry: { file: prompts/loop-retry.prompt }
+    execution: { file: prompts/loop-execution.prompt }
+    exhausted: { file: prompts/loop-exhausted.prompt }
+compaction:
+  plan: rules/compaction.mjs#plan
+  serialize: rules/compaction.mjs#serialize
+  merge: rules/compaction.mjs#merge
+  options: { file: policies/compaction.yaml }
+  prompts:
+    system: { file: prompts/compact-system.prompt }
+    initial: { file: prompts/compact-initial.prompt }
+    update: { file: prompts/compact-update.prompt }
+    turn: { file: prompts/compact-turn.prompt }
+    branch: { file: prompts/compact-branch.prompt }

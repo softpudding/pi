@@ -15,19 +15,22 @@ import type {
 	Usage,
 } from "@earendil-works/pi-ai";
 import {
-	type CodemodeOutputItem,
 	type CodemodeResult,
 	CodemodeSandbox,
+	type CodemodeSourceOptions,
 	type CodemodeTool,
+	loadQuickJSEncoding,
 	loadQuickJSWasm,
 	parseCodemodeSource,
 } from "@earendil-works/pi-codemode";
-import { getCodemodeWorkerSpecifier, getQuickJSWasmPath } from "../../config.ts";
+import { getCodemodeWorkerSpecifier, getQuickJSEncodingPath, getQuickJSWasmPath } from "../../config.ts";
 import type { ExtensionToolContext } from "../../core/extensions/types.ts";
 import type { SessionEntry } from "../../core/session-manager.ts";
 import { formatSize } from "../../core/tools/truncate.ts";
 import { combineUsage } from "../../core/usage-totals.ts";
 import { writeOutputFile } from "../../utils/output-files.ts";
+import { compileDefinition, loadDefaultFiles } from "./harness/definition.ts";
+import { renderHarnessOutput } from "./harness/output.ts";
 import { CodemodeRuntime } from "./runtime.ts";
 export { CodemodeRuntime };
 
@@ -219,8 +222,6 @@ export function readCodemodeStore(branch: readonly SessionEntry[]): Record<strin
 	return Object.fromEntries(store);
 }
 
-/** Default token budget for script output. */
-const DEFAULT_MAX_OUTPUT_TOKENS = 10_000;
 /** Characters per token when estimating. */
 const CHARS_PER_TOKEN = 4;
 
@@ -228,33 +229,6 @@ const CHARS_PER_TOKEN = 4;
 function valueText(value: unknown): string {
 	if (typeof value === "string") return value;
 	return JSON.stringify(value) ?? String(value);
-}
-
-/**
- * Lay out the script's output so the model can tell items apart: providers join adjacent text
- * blocks with a newline or with nothing. With more than one text item (`text()` or the returned
- * value), each starts with a `==> text N/M <==` line. `console.*` lines follow all other output in
- * one `<console_output>` block.
- */
-function formatOutput(output: readonly CodemodeOutputItem[]): (TextContent | ImageContent)[] {
-	const total = output.filter((item) => item.type === "text" && !item.console).length;
-	const items: (TextContent | ImageContent)[] = [];
-	const consoleLines: string[] = [];
-	let index = 0;
-	for (const item of output) {
-		if (item.type === "image") {
-			items.push(item);
-		} else if (item.console) {
-			consoleLines.push(item.text);
-		} else {
-			index++;
-			items.push({ type: "text", text: total > 1 ? `==> text ${index}/${total} <==\n${item.text}` : item.text });
-		}
-	}
-	if (consoleLines.length > 0) {
-		items.push({ type: "text", text: `<console_output>\n${consoleLines.join("\n")}\n</console_output>` });
-	}
-	return items;
 }
 
 /** Join adjacent text items into one, each part starting on its own line. */
@@ -385,7 +359,12 @@ export async function executeCodemode(
 	options: CodemodeToolOptions = {},
 ): Promise<AgentToolResult<CodemodeToolDetails>> {
 	const startedAt = performance.now();
-	const { code, options: sourceOptions } = parseCodemodeSource(input.code);
+	if ((input.code !== undefined) === (input.finish !== undefined))
+		throw new Error("Codemode requires exactly one of code or finish.");
+	if (input.finish !== undefined && input.data !== undefined)
+		throw new Error("Codemode data is input to code; finish accepts the final text directly.");
+	const source = input.code === undefined ? undefined : parseCodemodeSource(input.code);
+	const sourceOptions: CodemodeSourceOptions = source?.options ?? {};
 	const calls: CodemodeNestedCall[] = [];
 	// Usage of the script's `models.*` calls. Nested tool calls report theirs through the session.
 	let modelUsage: Usage | undefined;
@@ -402,12 +381,13 @@ export async function executeCodemode(
 	const publish = () => onUpdate?.({ content: [], details: snapshot() });
 
 	const runtime = ctx && options.getRuntime ? await options.getRuntime(ctx) : undefined;
+	const requestRevision = runtime?.harness.requestRevision;
 	const modelGlobals =
 		options.models && ctx
 			? createModelGlobals(ctx.modelRegistry, toolCallId, calls, publish, addModelUsage, addGeneratedImages)
 			: [];
 	const scope =
-		runtime && ctx
+		source && runtime && ctx
 			? runtime.createScope(
 					ctx,
 					async (name, args, execute) => {
@@ -417,6 +397,13 @@ export async function executeCodemode(
 							args: previewArgs(args),
 							status: "running",
 						};
+						const operation = /^(host\.fs|host\.harness)\.(read|write|edit)$/.exec(name);
+						if (operation && isRecord(args) && typeof args.path === "string")
+							record.effect = {
+								domain: operation[1] === "host.fs" ? "task" : "harness",
+								operation: operation[2] as "read" | "write" | "edit",
+								path: args.path,
+							};
 						calls.push(record);
 						publish();
 						const started = performance.now();
@@ -438,24 +425,39 @@ export async function executeCodemode(
 					},
 					"codemode",
 					modelGlobals,
+					toolCallId,
 				)
 			: undefined;
 
-	const sandbox = new CodemodeSandbox({
-		globals: scope?.globals ?? modelGlobals,
-		timeoutMs: sourceOptions.timeoutMs ?? Number.POSITIVE_INFINITY,
-		memoryLimitBytes: CODEMODE_MEMORY_LIMIT_BYTES,
-		wasm: loadQuickJSWasm(getQuickJSWasmPath()),
-		workerUrl: getCodemodeWorkerSpecifier(),
-	});
+	const sandbox = source
+		? new CodemodeSandbox({
+				globals: scope?.globals ?? modelGlobals,
+				timeoutMs: sourceOptions.timeoutMs ?? Number.POSITIVE_INFINITY,
+				memoryLimitBytes: CODEMODE_MEMORY_LIMIT_BYTES,
+				wasm: loadQuickJSWasm(getQuickJSWasmPath()),
+				encodingWasm: loadQuickJSEncoding(getQuickJSEncodingPath()),
+				workerUrl: getCodemodeWorkerSpecifier(),
+			})
+		: undefined;
 
 	let result: CodemodeResult;
 	try {
 		const store = ctx ? readCodemodeStore(ctx.sessionManager.getBranch()) : {};
-		result = await sandbox.execute(code, { signal, store });
+		signal?.throwIfAborted();
+		result =
+			sandbox && source
+				? await sandbox.execute(source.code, { signal, store, data: input.data })
+				: {
+						ok: true,
+						value: input.finish,
+						loopControl: "finish",
+						output: [],
+						calls: [],
+						storeWrites: { set: {}, delete: [] },
+					};
 	} finally {
 		scope?.close();
-		await sandbox.close();
+		await sandbox?.close();
 	}
 	// Calls still marked running were cut off by the script ending, a timeout, or an abort.
 	for (const call of calls) {
@@ -471,8 +473,17 @@ export async function executeCodemode(
 		// pi extension: a returned value is appended like text().
 		if (result.value !== undefined) scriptOutput.push({ type: "text", text: valueText(result.value) });
 	}
-	const items = formatOutput(scriptOutput);
+	const rendered =
+		runtime && requestRevision
+			? await runtime.renderOutput(scriptOutput, requestRevision)
+			: await renderHarnessOutput(await compileDefinition(loadDefaultFiles()), scriptOutput);
+	const items = rendered.items;
 	if (!result.ok) items.push({ type: "text", text: `Script error:\n${formatError(result, calls)}` });
+	if (rendered.error)
+		items.push({
+			type: "text",
+			text: `Presentation error:\n${rendered.error}\n\n${formatCallSummary(calls)}\nCompleted operations and committed state are retained. Repair the view and re-observe retained data; do not repeat completed side effects.`,
+		});
 	if (generatedImages > 0 && !items.some((item) => item.type === "image")) {
 		items.push({
 			type: "text",
@@ -482,22 +493,25 @@ export async function executeCodemode(
 
 	const truncated = await truncateOutput(
 		joinAdjacentText(items),
-		sourceOptions.maxOutputTokens ?? DEFAULT_MAX_OUTPUT_TOKENS,
+		sourceOptions.maxOutputTokens ?? rendered.maxOutputTokens,
 	);
 	// After truncation, which joins the text items and moves images after them, so each path stays
 	// next to its image and is never cut.
 	const output = joinAdjacentText(await saveImages(truncated.items));
 	const wallTime = ((performance.now() - startedAt) / 1000).toFixed(1);
-	const header = `${result.ok ? "Script completed" : "Script failed"}\nWall time ${wallTime} seconds\nOutput:\n`;
+	const ok = result.ok && !rendered.error;
+	const header = `${ok ? "Script completed" : "Script failed"}\nWall time ${wallTime} seconds\nOutput:\n`;
 	const details = snapshot();
-	if (result.ok && result.loopControl) details.loopControl = result.loopControl;
+	if (ok && result.ok && result.loopControl) details.loopControl = result.loopControl;
+	if (!result.ok) details.error = result.error;
+	if (rendered.error) details.error = { kind: "presentation", message: rendered.error };
 	if (truncated.fullOutputPath) details.fullOutputPath = truncated.fullOutputPath;
 	return {
 		content: [{ type: "text", text: header }, ...output],
 		details,
 		...(modelUsage ? { usage: modelUsage } : {}),
-		...(result.ok ? {} : { isError: true }),
-		...(result.ok && result.loopControl === "finish" ? { terminate: true } : {}),
+		...(ok ? {} : { isError: true }),
+		...(ok && result.ok && result.loopControl === "finish" ? { terminate: true } : {}),
 	};
 }
 

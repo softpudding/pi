@@ -60,6 +60,41 @@ function createToolComponent(outputPad = 1): ToolExecutionComponent {
 describe("codemode renderer", () => {
 	beforeAll(() => initTheme("dark"));
 
+	it("shows input data separately from code and renders a data-only final answer once", () => {
+		// biome-ignore lint/suspicious/noTemplateCurlyInString: Interpolation syntax must stay literal data.
+		const source = "source `with` ${syntax}";
+		const component = new ToolExecutionComponent(
+			"codemode",
+			"data-call",
+			{ code: "return loop.next(data);", data: { file: source } },
+			{ showImages: false, outputPad: 1 },
+			codemodeRenderers,
+			{ requestRender: () => {} } as TUI,
+			"/",
+		);
+		component.setExpanded(true);
+		const text = stripVTControlCharacters(component.render(200).join("\n"));
+		expect(text).toContain("return loop.next(data)");
+		expect(text).toContain(source);
+		const final = new ToolExecutionComponent(
+			"codemode",
+			"finish-call",
+			{ finish: "Final text" },
+			{ showImages: false, outputPad: 1 },
+			codemodeRenderers,
+			{ requestRender: () => {} } as TUI,
+			"/",
+		);
+		final.updateResult({
+			content: [{ type: "text", text: "Final text" }],
+			details: { calls: [], loopControl: "finish" },
+			isError: false,
+		});
+		const rendered = stripVTControlCharacters(final.render(80).join("\n"));
+		expect(rendered).toContain("codemode finish");
+		expect(rendered.match(/Final text/g)).toHaveLength(1);
+	});
+
 	it.each([0, 1, 3])("renders finish like an assistant reply outside the tool box (padding %s)", (outputPad) => {
 		const answer = `# Final answer\n\n**Verified**: \`42\`.\n\n${"完整的中文回复。 ".repeat(30)}`;
 		const result = {

@@ -4,26 +4,28 @@
  * The VM is its own wasm instance, so nothing here guards a realm boundary.
  * The prelude keeps the host bridge in a closure so the script cannot call it
  * directly, and builds `tools`, `ALL_TOOLS`, the output helpers (`text`, `image`,
- * `exit`, `console`), and globals on top of it. Tool arguments and results cross
+ * `observe`, `exit`, `console`), and globals on top of it. Tool arguments and results cross
  * as JSON strings and are parsed on this side.
  *
  * Output helpers: `text(value)` appends a text item (non-strings are
  * JSON-stringified), `image(urlOrItem)` appends an image from a base64 `data:` URL, an
  * `{ image_url }` object, or an MCP `ImageContent` block, and `exit()` ends the script
- * successfully. `console.*` appends text items marked as console output.
+ * successfully. `console.*` appends text items marked as console output. `observe(value)` emits
+ * a JSON snapshot for host presentation rules, keeping observation separate from returned data.
  *
  * `store(key, value)` and `load(key)` are synchronous: they work on a snapshot of
  * JSON text passed in as `storeJson`, and the keys the script wrote are reported
  * with a successful "done".
  *
- * Evaluates to a function `(bridge, toolsJson, globalsJson, storeJson) => { settle, run, stalled }`.
+ * Evaluates to `(bridge, toolsJson, globalsJson, storeJson, dataJson) => { settle, run, stalled }`.
  * `toolsJson` lists `{ name, jsName, description }`: `tools[jsName]` and `tools[name]` call the
  * tool, and `ALL_TOOLS` lists `{ name: jsName, description }`.
  * `stalled()` reports a script that has not finished while no host call is pending: with no timers
  * or I/O in the VM, nothing can ever resume it.
  * `globalsJson` lists `{ name, spread }`; `a.b` names are grouped into a frozen `a` object.
  * `bridge(kind, a, b, c, d)` with kind "call" or "global" (id, name, argsJson),
- * "output" ("text" or "console", text) or ("image", data, mimeType), or "done" (ok, valueJsonOrErrorJson, writesJson, loopControl).
+ * "output" ("text" or "console", text), ("observation", snapshotJson), or ("image", data, mimeType),
+ * or "done" (ok, valueJsonOrErrorJson, writesJson, loopControl).
  *
  * Before anything else the prelude freezes the built-ins and makes the built-in globals read-only.
  * The prelude shares them with the script, so a script that patched one (for example
@@ -32,8 +34,9 @@
 export const MAX_STORE_VALUE_CHARS = 256 * 1024;
 export const MAX_STORE_TOTAL_CHARS = 1024 * 1024;
 /**
- * Output one script may produce with `text()`, `image()`, and `console.*`: characters of text and
- * base64 image data, and items. The host keeps all output until the script ends, so without a
+ * Output one script may produce with `text()`, `observe()`, `image()`, and `console.*`: characters
+ * of text, serialized observations and base64 image data, and items. The host keeps all output
+ * until the script ends, so without a
  * limit a script that prints in a loop grows the host's memory until it crashes. The item limit
  * covers loops that print empty strings.
  */
@@ -43,7 +46,7 @@ export const MAX_OUTPUT_ITEMS = 100_000;
 const IMAGE_HELPER_EXPECTS =
 	"image expects a non-empty image URL string, an object with image_url, or a raw MCP image block";
 
-export const PRELUDE_SOURCE: string = `(function (bridge, toolsJson, globalsJson, storeJson) {
+export const PRELUDE_SOURCE: string = `(function (bridge, toolsJson, globalsJson, storeJson, dataJson) {
 	"use strict";
 
 	// Freeze every object reachable from the built-in globals, plus the intrinsics that are only
@@ -137,6 +140,7 @@ export const PRELUDE_SOURCE: string = `(function (bridge, toolsJson, globalsJson
 	})();
 	const stringify = JSON.stringify;
 	const parse = JSON.parse;
+	Object.defineProperty(globalThis, "data", { value: dataJson === undefined ? undefined : parse(dataJson), enumerable: true });
 	const promiseThen = Promise.prototype.then;
 	const ErrorCtor = Error;
 	const TypeErrorCtor = TypeError;
@@ -222,7 +226,9 @@ export const PRELUDE_SOURCE: string = `(function (bridge, toolsJson, globalsJson
 					return;
 				}
 				const id = nextId++;
-				pending.set(id, { resolve, reject });
+				// QuickJS does not retain an async caller's stack when settle() later rejects.
+				// Capture the source location now so failures point into the controller/module.
+				pending.set(id, { resolve, reject, error: new ErrorCtor() });
 				bridge(kind, id, name, json);
 			});
 	}
@@ -365,7 +371,7 @@ export const PRELUDE_SOURCE: string = `(function (bridge, toolsJson, globalsJson
 		outputItems++;
 		if (outputChars > ${MAX_OUTPUT_CHARS} || outputItems > ${MAX_OUTPUT_ITEMS}) {
 			const error = new RangeErrorCtor(
-				"script output exceeded the limit of ${MAX_OUTPUT_CHARS} characters or ${MAX_OUTPUT_ITEMS} text(), image(), and console calls. " +
+				"script output exceeded the limit of ${MAX_OUTPUT_CHARS} characters or ${MAX_OUTPUT_ITEMS} text(), observe(), image(), and console calls. " +
 					"Print a summary instead, or write large data to a file with a tool.",
 			);
 			done(false, describeError(error));
@@ -391,6 +397,29 @@ export const PRELUDE_SOURCE: string = `(function (bridge, toolsJson, globalsJson
 			throw new TypeErrorCtor(error instanceof ErrorCtor ? error.message : String(error));
 		}
 		output("text", rendered);
+	}
+
+	// The host renders this snapshot through its observation policy. No field names imply
+	// presentation or loop control, and later mutations cannot change an emitted observation.
+	function observe(value, options = {}) {
+		if (options === null || typeof options !== "object" || Array.isArray(options) ||
+			Object.keys(options).some(key => key !== "view") ||
+			options.view !== undefined && (typeof options.view !== "string" || !options.view.length)) {
+			throw new TypeErrorCtor('observe() options must be {view: "name"} or omitted');
+		}
+		let json;
+		try {
+			json = stringify({ value, view: options.view }, (_key, entry) => {
+				if (typeof entry === "function" || typeof entry === "symbol" || typeof entry === "bigint" ||
+					typeof entry === "number" && !Number.isFinite(entry)) {
+					throw new TypeErrorCtor("observe() expects JSON data or undefined");
+				}
+				return entry;
+			});
+		} catch (error) {
+			throw new TypeErrorCtor("observe() could not snapshot the value: " + (error instanceof ErrorCtor ? error.message : String(error)));
+		}
+		output("observation", json);
 	}
 
 	function imageUrl(value) {
@@ -472,6 +501,7 @@ export const PRELUDE_SOURCE: string = `(function (bridge, toolsJson, globalsJson
 	Object.defineProperty(globalThis, "ALL_TOOLS", { value: allTools, enumerable: true });
 	Object.defineProperty(globalThis, "console", { value: console, enumerable: true });
 	Object.defineProperty(globalThis, "text", { value: text, enumerable: true });
+	Object.defineProperty(globalThis, "observe", { value: observe, enumerable: true });
 	Object.defineProperty(globalThis, "image", { value: image, enumerable: true });
 	Object.defineProperty(globalThis, "exit", { value: exit, enumerable: true });
 
@@ -493,7 +523,8 @@ export const PRELUDE_SOURCE: string = `(function (bridge, toolsJson, globalsJson
 			if (!entry) return;
 			pending.delete(id);
 			if (!ok) {
-				entry.reject(new ErrorCtor(payload));
+				entry.error.message = payload;
+				entry.reject(entry.error);
 				return;
 			}
 			let value;
@@ -508,7 +539,7 @@ export const PRELUDE_SOURCE: string = `(function (bridge, toolsJson, globalsJson
 		run(fn) {
 			let promise;
 			try {
-				promise = fn(toolsProxy, console);
+				promise = fn();
 			} catch (error) {
 				done(false, describeError(error));
 				return;

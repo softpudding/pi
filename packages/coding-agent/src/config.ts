@@ -450,6 +450,20 @@ export function getDocsPath(): string {
 	return resolve(join(getPackageDir(), "docs"));
 }
 
+/** Resolve the editable Harness resources shipped with source, npm and binary builds. */
+export function getHarnessDefaultsDir(): string {
+	if (isBunBinary) return join(getPackageDir(), "harness");
+	const packageDir = getPackageDir();
+	return join(
+		packageDir,
+		existsSync(join(packageDir, "src")) ? "src" : "dist",
+		"extensions",
+		"codemode",
+		"harness",
+		"defaults",
+	);
+}
+
 /** Get path to examples directory */
 export function getExamplesPath(): string {
 	return resolve(join(getPackageDir(), "examples"));
@@ -481,10 +495,12 @@ export function getBundledInteractiveAssetPath(name: string): string {
 }
 
 let quickJSWasmPath: string | undefined;
+let quickJSEncodingPath: string | undefined;
 
 /** Called by the Bun entry with the path of the QuickJS wasm file embedded in the compiled executable. */
-export function setEmbeddedQuickJSWasmPath(path: string): void {
+export function setEmbeddedQuickJSWasmPaths(path: string, encodingPath: string): void {
 	quickJSWasmPath = path;
+	quickJSEncodingPath = encodingPath;
 }
 
 /**
@@ -494,6 +510,12 @@ export function setEmbeddedQuickJSWasmPath(path: string): void {
 export function getQuickJSWasmPath(): string {
 	quickJSWasmPath ??= createRequire(import.meta.url).resolve("quickjs-wasi/quickjs.wasm");
 	return quickJSWasmPath;
+}
+
+/** Resolve the standard encoding extension for source, npm and embedded binary workers. */
+export function getQuickJSEncodingPath(): string {
+	quickJSEncodingPath ??= createRequire(import.meta.url).resolve("quickjs-wasi/encoding.so");
+	return quickJSEncodingPath;
 }
 
 /** Resolve the codemode worker entry for a release runtime. */

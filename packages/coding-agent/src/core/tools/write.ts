@@ -39,6 +39,8 @@ const defaultWriteOperations: WriteOperations = {
 export interface WriteToolOptions {
 	/** Custom operations for file writing. Default: local filesystem */
 	operations?: WriteOperations;
+	resolvePath?: (path: string, cwd: string) => string;
+	mutationQueue?: typeof withFileMutationQueue;
 }
 
 export function createWriteToolDefinition(
@@ -62,9 +64,9 @@ export function createWriteToolDefinition(
 			_onUpdate?,
 			ctx?: ExtensionContext,
 		) {
-			const absolutePath = resolveToCwd(path, ctx?.cwd || cwd);
+			const absolutePath = (options?.resolvePath ?? resolveToCwd)(path, ctx?.cwd || cwd);
 			const dir = dirname(absolutePath);
-			return withFileMutationQueue(absolutePath, async () => {
+			return (options?.mutationQueue ?? withFileMutationQueue)(absolutePath, async () => {
 				// Do not reject from an abort event listener here: that would release the
 				// mutation queue while an in-flight filesystem operation may still finish.
 				// Checking signal.aborted after each await observes the same aborts while

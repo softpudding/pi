@@ -1,6 +1,7 @@
 import type { AgentTool } from "@earendil-works/pi-agent-core";
 import { Type } from "typebox";
 import { describe, expect, it } from "vitest";
+import { ATOMIC_CODEMODE_API } from "../src/extensions/codemode/api.ts";
 import { createCodemodeDescription } from "../src/extensions/codemode/tool.ts";
 import { Bm25Ranker, createToolSearchDocument, tokenize } from "../src/extensions/tool-search/tool.ts";
 
@@ -64,22 +65,24 @@ describe("Bm25Ranker", () => {
 });
 
 describe("codemode atomic description", () => {
-	it("documents primitives and model-owned registration without a builtin catalog", () => {
-		const description = createCodemodeDescription();
+	it("documents primitives and file-defined Harness tools without a builtin catalog", () => {
+		const description = ATOMIC_CODEMODE_API;
 		for (const name of [
-			"host.fs.read",
-			"host.process.spawn",
-			"host.modules.put",
-			"host.tools.register",
-			"host.tools.unregister",
-			"host.hooks.register",
-			"host.registry.apply",
-			"loop.finish",
+			"declare const host:",
+			"fs: {",
+			"process: {",
+			"harness: {",
+			"read(args:",
+			"write(args:",
+			"edit(args:",
+			"prepare(args:",
+			"activate(args:",
 		])
 			expect(description).toContain(name);
 		expect(description).not.toContain("Nested tools:");
 		expect(description).not.toContain("describeTool");
 		expect(description).not.toContain("searchTools");
-		expect(description).toBe(createCodemodeDescription());
+		expect(createCodemodeDescription()).toContain("agent.yaml");
+		expect(createCodemodeDescription()).not.toMatch(/free.form|JSON|loop.next/);
 	});
 });

@@ -159,8 +159,16 @@ export function getGrammarToolInput(
 	toolName: string,
 	arguments_: Record<string, unknown>,
 	inputProperty: string,
+	config?: Tool["constrainedSampling"],
 ): string {
 	const input = arguments_[inputProperty];
+	if (
+		config &&
+		config.type === "grammar" &&
+		config.allowJsonInput &&
+		(typeof input !== "string" || Object.keys(arguments_).some((key) => key !== inputProperty))
+	)
+		return JSON.stringify(arguments_);
 	if (typeof input !== "string") {
 		throw new Error(`Grammar tool call "${toolName}" requires argument "${inputProperty}" to be a string.`);
 	}
@@ -199,16 +207,19 @@ export function appendGrammarToolInputJsonDelta(
 	return delta;
 }
 
-function inferGrammarInputProperty(tool: Tool): string {
+function inferGrammarInputProperty(tool: Tool, explicitProperty?: string): string {
 	const schema = tool.parameters as JsonSchemaObject;
 	if (schema.type !== "object") {
 		throw new Error("grammar constrained sampling requires an object parameter schema");
 	}
-	if (!Array.isArray(schema.required) || schema.required.length !== 1 || typeof schema.required[0] !== "string") {
+	if (
+		explicitProperty === undefined &&
+		(!Array.isArray(schema.required) || schema.required.length !== 1 || typeof schema.required[0] !== "string")
+	) {
 		throw new Error("grammar constrained sampling requires exactly one required string property");
 	}
 
-	const inputProperty = schema.required[0];
+	const inputProperty = explicitProperty ?? (schema.required as string[])[0];
 	if (!schema.properties?.[inputProperty]) {
 		throw new Error(`grammar constrained sampling requires a properties entry for ${inputProperty}`);
 	}
@@ -275,7 +286,7 @@ export function resolveGrammarConstrainedSampling(
 		return {
 			format: hasLarkDefinition ? "lark" : "regex",
 			definition: hasLarkDefinition ? larkDefinition : regexDefinition!,
-			inputProperty: inferGrammarInputProperty(tool),
+			inputProperty: inferGrammarInputProperty(tool, config.inputProperty),
 		};
 	} catch (error) {
 		const message = error instanceof Error ? error.message : String(error);

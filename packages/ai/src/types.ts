@@ -722,6 +722,10 @@ export type ConstrainedSamplingConfig =
 	| {
 			type: "grammar";
 			variants: GrammarVariants;
+			/** Property receiving raw input. Defaults to the schema's single required string property. */
+			inputProperty?: string;
+			/** Grammar also accepts a JSON argument object. Replay structured calls without dropping other fields. */
+			allowJsonInput?: boolean;
 	  };
 
 export interface Tool<TParameters extends TSchema = TSchema> {

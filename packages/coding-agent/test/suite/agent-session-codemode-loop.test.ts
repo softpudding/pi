@@ -3,6 +3,7 @@ import { Type } from "typebox";
 import { afterEach, describe, expect, it } from "vitest";
 import { CODEMODE_LOOP_REMINDER_TYPE, createCodemodeExtension } from "../../src/extensions/codemode/index.ts";
 import { createHarness, getMessageText, getToolResult, type Harness, type HarnessOptions } from "./harness.ts";
+import { harnessToolFiles, installHarnessFiles } from "./harness-programs.ts";
 
 const harnesses: Harness[] = [];
 
@@ -35,9 +36,11 @@ afterEach(() => {
 });
 
 describe("AgentSession explicit codemode loop", () => {
-	it("appends next results once, preserves the request prefix, and finishes without an extra inference", async () => {
+	it("appends next results once, preserves history across a definition update, and finishes without an extra inference", async () => {
 		const harness = await setup();
-		const install = `const m = await host.modules.put({id:"fixture",source:'export function run() { return {content:[{type:"text",text:"selected evidence"}],details:{}}; }'}); await host.tools.register({name:"fixture.run",description:"Return evidence",parameters:{type:"object"},handler:{module:m.id,revision:m.revision,export:"run"}});`;
+		const install = installHarnessFiles(
+			harnessToolFiles('export function run() { return "selected evidence"; }', "fixture.run", { type: "object" }),
+		);
 		const requests: TranscriptContext["messages"][] = [];
 		harness.setResponses([
 			(context) => {
@@ -60,7 +63,9 @@ describe("AgentSession explicit codemode loop", () => {
 		expect(
 			harness.eventsOfType("tool_execution_start").filter((event) => event.toolName === "fixture.run"),
 		).toHaveLength(1);
-		expect(requests[1].slice(0, requests[0].length)).toEqual(requests[0]);
+		expect(requests[1].filter((m) => m.role !== "system").slice(0, 1)).toEqual(
+			requests[0].filter((m) => m.role !== "system"),
+		);
 		expect(JSON.stringify(requests[1])).toContain("PREFIX-MARKER");
 		const results = harness.session.messages.filter((message) => message.role === "toolResult");
 		expect(results).toHaveLength(2);
@@ -102,6 +107,8 @@ describe("AgentSession explicit codemode loop", () => {
 			["finish", "finish"],
 			["next", "finish"],
 			["finish", "next"],
+			["finish-input", "next"],
+			["finish-input", "finish-input"],
 			["codemode", "fixture"],
 			["fixture", "codemode"],
 		] as const)("rejects %s + %s before any tool or script executes", async (first, second) => {
@@ -127,9 +134,11 @@ describe("AgentSession explicit codemode loop", () => {
 			const calls = [first, second].map((kind) =>
 				kind === "fixture"
 					? fauxToolCall("fixture", {})
-					: fauxToolCall("codemode", {
-							code: `store("blocked", true); await tools.fixture({}); return loop.${kind === "next" ? "next" : "finish"}("must not run");`,
-						}),
+					: kind === "finish-input"
+						? fauxToolCall("codemode", { finish: "must not finish" })
+						: fauxToolCall("codemode", {
+								code: `store("blocked", true); await tools.fixture({}); return loop.${kind === "next" ? "next" : "finish"}("must not run");`,
+							}),
 			);
 			let prefix: TranscriptContext["messages"] = [];
 			harness.setResponses([
@@ -161,6 +170,7 @@ describe("AgentSession explicit codemode loop", () => {
 			expect(harness.faux.state.callCount).toBe(2);
 			expect(harness.getPendingResponseCount()).toBe(1);
 			expect(reminders(harness)).toHaveLength(1);
+			expect(reminders(harness)[0]).toMatchObject({ details: { outcome: { status: "invalid_batch" } } });
 			expect(getToolResult(harness, "codemode")).toMatchObject({
 				isError: false,
 				details: { loopControl: "finish" },
@@ -173,9 +183,15 @@ describe("AgentSession explicit codemode loop", () => {
 		const source = `export async function run({value}) {
       await host.state.set({key:value,value:true});
       while (!(await host.state.get({key:value === "left" ? "right" : "left"}))) await host.clock.sleep({ms:5});
-      return {content:[{type:"text",text:value}],details:{}};
+      return value;
     }`;
-		const install = `const m = await host.modules.put({id:"fixture",source:${JSON.stringify(source)}}); await host.tools.register({name:"fixture.run",description:"Wait for both calls",parameters:{type:"object",properties:{value:{type:"string"}},required:["value"]},handler:{module:m.id,revision:m.revision,export:"run"}});`;
+		const install = installHarnessFiles(
+			harnessToolFiles(source, "fixture.run", {
+				type: "object",
+				properties: { value: { type: "string" } },
+				required: ["value"],
+			}),
+		);
 		harness.setResponses([
 			script(`// @options: {"timeout_ms": 5000}
 ${install}
@@ -264,39 +280,50 @@ return loop.finish(results);`),
 		expect(reminders(harness).at(-1)).toMatchObject({ details: { exhausted: true } });
 	});
 
-	it("corrects a native text-only stop by appending a message, without replacing history", async () => {
+	it("accepts a native final answer without an extra inference or tool call", async () => {
 		const harness = await setup();
-		let prefix: TranscriptContext["messages"] = [];
-		harness.setResponses([
-			(context) => {
-				prefix = structuredClone(context.messages);
-				return fauxAssistantMessage("The answer is 42.");
-			},
-			(context) => {
-				expect(context.messages.slice(0, prefix.length)).toEqual(prefix);
-				expect(context.messages.some((message) => getMessageText(message) === "The answer is 42.")).toBe(true);
-				expect(getMessageText(context.messages.at(-1))).toContain("return loop.finish(answer)");
-				expect(getMessageText(context.messages.at(-1))).toContain("return loop.next(results)");
-				return script('return loop.finish("The answer is 42.");');
-			},
-			fauxAssistantMessage("must not run"),
-		]);
+		const answer = `The answer is 42. Markdown: \`code\`, "quotes", \${data}.`;
+		harness.setResponses([fauxAssistantMessage(answer), fauxAssistantMessage("must not run")]);
 		await harness.session.prompt("Compute 6 * 7.");
-		expect(harness.faux.state.callCount).toBe(2);
-		expect(reminders(harness)).toHaveLength(1);
-		expect(getToolResult(harness, "codemode").details).toMatchObject({ loopControl: "finish" });
+		expect(harness.faux.state.callCount).toBe(1);
+		expect(harness.getPendingResponseCount()).toBe(1);
+		expect(harness.eventsOfType("tool_execution_start")).toEqual([]);
+		expect(reminders(harness)).toEqual([]);
+		expect(getMessageText(harness.session.messages.at(-1))).toBe(answer);
 	});
 
-	it("also corrects a native final answer after an explicit next", async () => {
+	it("accepts a native final answer after observing next results", async () => {
 		const harness = await setup();
 		harness.setResponses([
 			script('return loop.next("evidence");'),
-			fauxAssistantMessage("Done."),
-			script('return loop.finish("Done.");'),
+			(context) => {
+				expect(getMessageText(context.messages.at(-1))).toContain("evidence");
+				return fauxAssistantMessage("Done.");
+			},
 		]);
 		await harness.session.prompt("Go.");
-		expect(harness.faux.state.callCount).toBe(3);
+		expect(harness.faux.state.callCount).toBe(2);
+		expect(reminders(harness)).toEqual([]);
+		expect(getMessageText(harness.session.messages.at(-1))).toBe("Done.");
+	});
+
+	it.each([
+		["", "stop"],
+		[" \n\t", "stop"],
+		["unfinished answer", "length"],
+	] as const)("recovers an empty or incomplete native answer (%j, %s)", async (text, stopReason) => {
+		const harness = await setup();
+		harness.setResponses([
+			fauxAssistantMessage(text, { stopReason }),
+			(context) => {
+				expect(getMessageText(context.messages.at(-1))).toContain("No valid loop decision");
+				return fauxAssistantMessage("Complete answer.");
+			},
+		]);
+		await harness.session.prompt("Answer completely.");
+		expect(harness.faux.state.callCount).toBe(2);
 		expect(reminders(harness)).toHaveLength(1);
+		expect(reminders(harness)[0]).toMatchObject({ details: { outcome: { status: "missing_decision" } } });
 	});
 
 	it.each([
@@ -330,6 +357,81 @@ return loop.finish(results);`),
 		expect(harness.faux.state.callCount).toBe(2);
 	});
 
+	it("separates execution recovery from protocol corrections and resets budgets after next", async () => {
+		const harness = await setup();
+		harness.setResponses([
+			script(
+				`${installHarnessFiles({ "policies/loop.yaml": "maxCorrections: 1\nmaxExecutionRecoveries: 2\n" })}return loop.next("configured");`,
+			),
+			script(
+				'await host.state.set({key:"committed",value:1}); throw new TypeError("bad result shape"); return loop.next("unreachable");',
+			),
+			(context) => {
+				const reminder = getMessageText(context.messages.at(-1));
+				expect(reminder).toContain("bad result shape");
+				expect(reminder).toContain("host.state.set");
+				expect(reminder).not.toContain("You did not correctly control");
+				return fauxAssistantMessage("");
+			},
+			script("const broken = ; return loop.next();"),
+			script('return loop.next(await host.state.get({key:"committed"}));'),
+			script('throw new Error("new recovery budget");'),
+			script('return loop.finish(await host.state.get({key:"committed"}));'),
+		]);
+		await harness.session.prompt("Recover without replaying effects.");
+		expect(harness.faux.state.callCount).toBe(7);
+		expect(reminders(harness)).toMatchObject([
+			{
+				details: {
+					outcome: {
+						status: "execution_failed",
+						results: [
+							{
+								error: { kind: "script", name: "TypeError" },
+								calls: [{ name: "host.state.set", status: "ok" }],
+							},
+						],
+					},
+					state: { executionFailures: 1 },
+					reminder: "execution",
+				},
+			},
+			{
+				details: {
+					outcome: { status: "missing_decision" },
+					state: { executionFailures: 1, protocolCorrections: 1 },
+					reminder: "retry",
+				},
+			},
+			{
+				details: {
+					outcome: { status: "execution_failed", results: [{ error: { name: "SyntaxError" }, calls: [] }] },
+					state: { executionFailures: 2, protocolCorrections: 1 },
+				},
+			},
+			{ details: { state: { executionFailures: 1 }, reminder: "execution" } },
+		]);
+		expect(getToolResult(harness, "codemode")).toMatchObject({ isError: false, details: { loopControl: "finish" } });
+	});
+
+	it("exhausts the editable execution budget independently of the protocol budget", async () => {
+		const harness = await setup();
+		harness.setResponses([
+			script(
+				`${installHarnessFiles({ "policies/loop.yaml": "maxCorrections: 9\nmaxExecutionRecoveries: 1\n" })}return loop.next();`,
+			),
+			script('throw new Error("first failure");'),
+			script('throw new Error("second failure");'),
+		]);
+		await harness.session.prompt("Exercise execution recovery exhaustion.");
+		expect(reminders(harness)).toHaveLength(2);
+		expect(reminders(harness).at(-1)).toMatchObject({
+			content: expect.stringContaining("executionFailures=1"),
+			details: { exhausted: true, outcome: { status: "execution_failed" }, state: { executionFailures: 1 } },
+		});
+		expect(harness.eventsOfType("tool_execution_start")).toHaveLength(3);
+	});
+
 	it("does not execute truncated controller scripts", async () => {
 		const harness = await setup();
 		harness.setResponses([
@@ -348,10 +450,7 @@ return loop.finish(results);`),
 	it("bounds correction attempts and reports failure instead of successful completion", async () => {
 		const harness = await setup();
 		harness.setResponses([
-			fauxAssistantMessage("one"),
-			fauxAssistantMessage("two"),
-			fauxAssistantMessage("three"),
-			fauxAssistantMessage("four"),
+			...Array.from({ length: 4 }, () => fauxAssistantMessage("")),
 			script('return loop.finish("must not run");'),
 		]);
 		await harness.session.prompt("Go.");
@@ -359,7 +458,7 @@ return loop.finish(results);`),
 		expect(harness.getPendingResponseCount()).toBe(1);
 		expect(reminders(harness)).toHaveLength(4);
 		expect(reminders(harness).at(-1)).toMatchObject({
-			content: expect.stringContaining("protocol error"),
+			content: expect.stringContaining("recovery budget is exhausted"),
 			details: { exhausted: true },
 		});
 	});

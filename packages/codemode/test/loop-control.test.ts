@@ -17,6 +17,39 @@ afterEach(async () => {
 });
 
 describe("codemode loop control", () => {
+	it("allows local names to shadow outer capabilities without hidden parameter collisions", async () => {
+		const sandbox = createSandbox();
+		expect(
+			await sandbox.execute(`
+      const echo = globalThis.tools.echo;
+      const tools = await echo(["one", "two"]);
+      const console = { message: "local console" };
+      const text = "local text", image = "local image", store = "local store", load = "local load";
+      const exit = "local exit", ALL_TOOLS = "local catalog", loop = globalThis.loop;
+      globalThis.console.log("outer console");
+      return loop.next({ tools, console, text, image, store, load, exit, ALL_TOOLS });
+    `),
+		).toMatchObject({
+			ok: true,
+			loopControl: "next",
+			value: {
+				tools: ["one", "two"],
+				console: { message: "local console" },
+				text: "local text",
+				image: "local image",
+				store: "local store",
+				load: "local load",
+				exit: "local exit",
+				ALL_TOOLS: "local catalog",
+			},
+			output: [{ type: "text", text: "outer console", console: true }],
+		});
+		expect(await sandbox.execute('const tools = 1;\nthrow new Error("line marker");')).toMatchObject({
+			ok: false,
+			error: { stack: expect.stringContaining("codemode.js:2:") },
+		});
+	});
+
 	it.each(["next", "finish"] as const)("separates %s from ordinary return data and output", async (action) => {
 		const sandbox = createSandbox();
 		const body =

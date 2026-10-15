@@ -76,8 +76,9 @@ export const codemodeRenderers: Pick<
 	renderShell: "self",
 	renderCall(args, theme, context) {
 		// The code includes the `// @options:` line, so options show as part of the script.
-		const code = str((args as { code?: unknown } | undefined)?.code);
-		const title = theme.fg("toolTitle", theme.bold("codemode"));
+		const input = args as { code?: unknown; data?: unknown; finish?: unknown } | undefined;
+		const code = str(input?.code);
+		const title = theme.fg("toolTitle", theme.bold(input?.finish === undefined ? "codemode" : "codemode finish"));
 		const component = (context.lastComponent as Box | undefined) ?? new Box(context.outputPad, 1);
 		component.setPaddingX(context.outputPad);
 		component.setBgFn((text) =>
@@ -88,13 +89,17 @@ export const codemodeRenderers: Pick<
 		component.addChild(call);
 		context.state.toolOutput ??= new Container();
 		component.addChild(context.state.toolOutput);
-		if (code === null) {
+		if (code === null || str(input?.finish) === null) {
 			call.addChild(new Text(`${title} ${theme.fg("error", "[invalid arg]")}`, 0, 0));
 			return component;
 		}
 		call.addChild(new Text(title, 0, 0));
-		if (code) {
-			const highlighted = highlightCode(replaceTabs(code.replace(/\r/g, "").trimEnd()), "javascript").join("\n");
+		for (const [value, language] of [
+			[code, "javascript"],
+			[input?.data === undefined ? "" : JSON.stringify(input.data, null, 2), "json"],
+		]) {
+			if (!value) continue;
+			const highlighted = highlightCode(replaceTabs(value.replace(/\r/g, "").trimEnd()), language).join("\n");
 			call.addChild(
 				context.expanded
 					? new Text(highlighted, 0, 0)

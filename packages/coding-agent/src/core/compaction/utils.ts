@@ -29,6 +29,21 @@ export function createFileOps(): FileOperations {
  */
 export function extractFileOpsFromMessage(message: AgentMessage, fileOps: FileOperations): void {
 	if (message.role === "toolResult") {
+		// Primitive effects have a target domain. Never infer project edits from a model's tool name.
+		if (
+			message.toolName === "codemode" &&
+			message.details &&
+			typeof message.details === "object" &&
+			"calls" in message.details &&
+			Array.isArray(message.details.calls)
+		) {
+			for (const call of message.details.calls) {
+				if (!call || typeof call !== "object" || call.status !== "ok") continue;
+				const effect = call.effect;
+				if (effect?.domain === "task" && typeof effect.path === "string")
+					addFileOp(effect.operation, { path: effect.path }, fileOps);
+			}
+		}
 		// Calls made from codemode scripts are recorded on the script's result.
 		for (const call of message.nestedCalls?.calls ?? []) addFileOp(call.name, call.arguments, fileOps);
 		return;

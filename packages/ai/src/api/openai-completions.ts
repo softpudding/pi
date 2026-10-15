@@ -1198,6 +1198,9 @@ export function convertMessages(
 ): ChatCompletionMessageParam[] {
 	const normalizedContext = resolveTranscript(context, compat.supportsMidConvoSystemMessages);
 	const params: ChatCompletionMessageParam[] = [];
+	const toolConfigs = new Map(
+		getDeclaredTools(normalizedContext.messages).map((tool) => [tool.name, tool.constrainedSampling]),
+	);
 
 	const normalizeToolCallId = (id: string): string => {
 		// Handle pipe-separated IDs from OpenAI Responses API
@@ -1366,7 +1369,9 @@ export function convertMessages(
 							type: "custom",
 							custom: {
 								name: tc.name,
-								input: sanitizeSurrogates(getGrammarToolInput(tc.name, tc.arguments, customInputProperty)),
+								input: sanitizeSurrogates(
+									getGrammarToolInput(tc.name, tc.arguments, customInputProperty, toolConfigs.get(tc.name)),
+								),
 							},
 						};
 					}

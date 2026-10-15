@@ -1,0 +1,5 @@
+customRole: user
+compactionPrefix: "The conversation history before this point was compacted into the following summary:\n\n<summary>\n"
+compactionSuffix: "\n</summary>"
+branchPrefix: "The following is a summary of a branch that this conversation came back from:\n\n<summary>\n"
+branchSuffix: "</summary>"

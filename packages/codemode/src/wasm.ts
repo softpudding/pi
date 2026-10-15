@@ -33,3 +33,8 @@ export function loadQuickJSWasm(path?: string): Promise<CodemodeWasmModule> {
 	}
 	return module;
 }
+
+/** Load the standard text encoding extension, using the same compiled-module cache. */
+export function loadQuickJSEncoding(path?: string): Promise<CodemodeWasmModule> {
+	return loadQuickJSWasm(path ?? createRequire(import.meta.url).resolve("quickjs-wasi/encoding.so"));
+}

@@ -98,29 +98,30 @@ const defaultEditOperations: EditOperations = {
 export interface EditToolOptions {
 	/** Custom operations for file editing. Default: local filesystem */
 	operations?: EditOperations;
+	resolvePath?: (path: string, cwd: string) => string;
+	mutationQueue?: typeof withFileMutationQueue;
+}
+
+/** Normalize only the edits container; document strings are never unescaped or repaired. */
+export function normalizeEditReplacements(edits: unknown): unknown {
+	if (typeof edits === "string") {
+		try {
+			const parsed: unknown = JSON.parse(edits);
+			if (Array.isArray(parsed)) return parsed;
+			if (isSingleEditInput(parsed)) return [parsed];
+		} catch {}
+	} else if (isSingleEditInput(edits)) {
+		return [edits];
+	}
+	return edits;
 }
 
 function prepareEditArguments(input: unknown): EditToolInput {
 	if (!input || typeof input !== "object") {
 		return input as EditToolInput;
 	}
-
 	const args = input as Record<string, unknown>;
-
-	// Some models (Opus 4.6, GLM-5.1) send edits as a JSON string instead of an array.
-	// Others send a single edit object instead of a one-element edits array.
-	if (typeof args.edits === "string") {
-		try {
-			const parsed = JSON.parse(args.edits);
-			if (Array.isArray(parsed)) {
-				args.edits = parsed;
-			} else if (isSingleEditInput(parsed)) {
-				args.edits = [parsed];
-			}
-		} catch {}
-	} else if (isSingleEditInput(args.edits)) {
-		args.edits = [args.edits];
-	}
+	args.edits = normalizeEditReplacements(args.edits);
 
 	const legacy = args as LegacyEditToolInput;
 	if (typeof legacy.oldText !== "string" || typeof legacy.newText !== "string") {
@@ -158,9 +159,9 @@ export function createEditToolDefinition(
 		prepareArguments: prepareEditArguments,
 		async execute(_toolCallId, input: EditToolInput, signal?: AbortSignal, _onUpdate?, ctx?: ExtensionContext) {
 			const { path, edits } = validateEditInput(input);
-			const absolutePath = resolveToCwd(path, ctx?.cwd || cwd);
+			const absolutePath = (options?.resolvePath ?? resolveToCwd)(path, ctx?.cwd || cwd);
 
-			return withFileMutationQueue(absolutePath, async () => {
+			return (options?.mutationQueue ?? withFileMutationQueue)(absolutePath, async () => {
 				// Do not reject from an abort event listener here: that would release the
 				// mutation queue while an in-flight filesystem operation may still finish.
 				// Checking signal.aborted after each await observes the same aborts while

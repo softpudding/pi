@@ -2,7 +2,7 @@
 
 Runs model-written JavaScript in a QuickJS VM (compiled to WebAssembly) where the only capability is calling injected tools. Nested tool calls never enter the LLM context; only the script's output and return value do.
 
-Scripts use `tools`, `ALL_TOOLS`, `text`, `image`, `exit`, `store`, and `load`, and may start with a `// @options:` line. The coding agent uses it for its built-in `codemode` tool. It has no pi dependencies and can be used on its own to expose any functions (remote APIs, MCP servers, application services) to model-written scripts.
+Scripts use `tools`, `ALL_TOOLS`, `text`, `observe`, `image`, `exit`, `store`, and `load`, and may start with a `// @options:` line. The coding agent uses it for its built-in `codemode` tool. It has no pi dependencies and can be used on its own to expose any functions (remote APIs, MCP servers, application services) to model-written scripts.
 
 ## Usage
 
@@ -40,15 +40,21 @@ await sandbox.close();
 - `tools.<name>(args)` returns a promise. Arguments and results make a JSON round trip. A tool that throws rejects with an `Error` carrying the same message. Tool names are also exposed as identifiers: characters that are not valid in identifiers become `_` (`toCodemodeIdentifier`), so `my-tool` is `tools.my_tool` as well as `tools["my-tool"]`.
 - `ALL_TOOLS` lists `{ name, description }` for every tool, with `name` as the identifier.
 - `text(value)` appends a text item to `result.output`; values other than strings are JSON-stringified. `console.log/info/warn/error/debug` append text items with `console: true`.
+- `observe(value, {view?: string})` synchronously appends `{type:"observation",value,view?}` with a JSON snapshot and returns `undefined`. It leaves the original value unchanged and selects no loop decision. The sandbox only records data and the selected view. The host chooses presentation; the coding agent requires an explicit view for objects/arrays and dispatches through editable Harness mappings and pure handlers. Strings display directly there; missing/unknown views fail presentation without a recursive fallback. `undefined` is allowed; nested undefined values follow JSON conventions. Functions, symbols, bigints, non-finite numbers and cycles are rejected.
 - `image(urlOrItem)` appends an image item. It accepts a base64 `data:` URL, `{ image_url }`, or an MCP `ImageContent` block (`{ type: "image", data, mimeType }`). Remote URLs are rejected.
 - `exit()` ends the script successfully right away, keeping its output and store writes.
 - `globals` passed to the sandbox are called as top-level functions, for example a host helper `image(ref)`. They behave like tools but are not recorded in `result.calls`. Dotted names support nested frozen namespaces, for example `host.fs.read` and `models.classify`. With `spread: true`, `execute` receives all call arguments as an array instead of the first one, and `signature` replaces the declaration generated from the schemas.
 - `store(key, value)` and `load(key)` read and write JSON values synchronously. See [Store](#store).
+- Standard `TextEncoder` and `TextDecoder`, including streaming decoding, run inside the VM through QuickJS's encoding extension.
 - Nothing else: no timers, `fetch`, `process`, `require`, modules, or `WebAssembly`. `eval` and `Function` work but only produce more code inside the same VM.
 
 `timeoutMs: Infinity` disables the deadline; the script then runs until it settles or `signal` aborts it. A script that waits on a promise nothing can settle (no tool call pending, and the VM has no timers or I/O) fails right away instead of hanging.
 
 `memoryLimitBytes` caps the VM's heap. Allocations beyond it fail inside the script as `InternalError: out of memory`.
+
+Injected capabilities live in the outer scope. Scripts can declare ordinary local variables such as `const tools` or `const console`; these shadow the outer bindings using normal JavaScript rules.
+
+Pass invocation input as `sandbox.execute(code, { data: value })`. The JSON value is available through the outer `data` binding, so file contents, source modules and prompt text do not need to be embedded in JavaScript strings. It is local to that invocation and is not persisted in the store. When omitted, `data` is `undefined`.
 
 ## Source modules
 
@@ -94,15 +100,16 @@ Supported fields are `max_output_tokens`, a token budget for the output, and `ti
 
 ## Bundled hosts
 
-By default the sandbox loads `quickjs-wasi/quickjs.wasm` from the installed package and starts the worker file that sits next to this package's module. Neither exists on disk when the host is bundled, so pass both:
+By default the sandbox loads `quickjs-wasi/quickjs.wasm` and `quickjs-wasi/encoding.so` from the installed package and starts the worker file that sits next to this package's module. Bundled hosts supply the embedded assets and worker:
 
 ```ts
-import { CodemodeSandbox, loadQuickJSWasm } from "@earendil-works/pi-codemode";
+import { CodemodeSandbox, loadQuickJSEncoding, loadQuickJSWasm } from "@earendil-works/pi-codemode";
 
 const sandbox = new CodemodeSandbox({
 	tools,
 	// Compiled once per path and cached.
 	wasm: loadQuickJSWasm(pathToQuickJSWasm),
+	encodingWasm: loadQuickJSEncoding(pathToEncodingWasm),
 	// A file of your build containing `import "@earendil-works/pi-codemode/worker";`
 	workerUrl: new URL("./codemode-worker.js", import.meta.url),
 });
@@ -134,6 +141,7 @@ To give an `Agent` a codemode tool, expose its other tools to the sandbox and wr
 
 ```ts
 import type { AgentTool } from "@earendil-works/pi-agent-core";
+import type { ImageContent, TextContent } from "@earendil-works/pi-ai";
 import {
 	type CodemodeJsonSchema,
 	CodemodeSandbox,
@@ -154,16 +162,29 @@ const sandboxTools: CodemodeTool[] = agentTools.map((tool) => ({
 	},
 }));
 
+// Presentation belongs to the host. This minimal example preserves string values verbatim.
+function renderObservation(value: unknown, path = "$"): string {
+	if (value !== null && typeof value === "object") {
+		return [
+			`${path} (${Array.isArray(value) ? "array" : "object"})`,
+			...Object.entries(value).map(([key, child]) => renderObservation(child, `${path}[${JSON.stringify(key)}]`)),
+		].join("\n\n");
+	}
+	return `${path} (${value === null ? "null" : typeof value}):\n${String(value)}`;
+}
+
 const codemodeTool: AgentTool = {
 	name: "codemode",
 	label: "Codemode",
-	description: `Run JavaScript that calls tools as \`await tools.<name>(args)\`. Output with text() or return.\n\n${renderDeclarations({ tools: sandboxTools })}`,
+	description: `Run JavaScript that calls tools as \`await tools.<name>(args)\`. Show structured results with observe(); strings remain literal text. Output with text() or return also works.\n\n${renderDeclarations({ tools: sandboxTools })}`,
 	parameters: Type.Object({ code: Type.String() }),
 	execute: async (_toolCallId, { code }, signal) => {
 		const sandbox = new CodemodeSandbox({ tools: sandboxTools });
 		try {
 			const result = await sandbox.execute(code, { signal });
-			const content = [...result.output];
+			const content: (TextContent | ImageContent)[] = result.output.map((item) =>
+				item.type === "observation" ? { type: "text", text: renderObservation(item.value) } : item,
+			);
 			if (result.ok && result.value !== undefined) content.push({ type: "text", text: JSON.stringify(result.value) });
 			if (!result.ok) content.push({ type: "text", text: result.error.stack ?? result.error.message });
 			return { content, details: undefined, isError: !result.ok };
@@ -174,7 +195,7 @@ const codemodeTool: AgentTool = {
 };
 ```
 
-`result.output` items already have the shape of `@earendil-works/pi-ai`'s `TextContent` and `ImageContent`. Calling `tool.execute()` directly skips the agent's `beforeToolCall` and `afterToolCall` hooks. To apply them to nested calls too, run each call through `runToolCall()` from `@earendil-works/pi-agent-core`, as the [mcp-codemode example](https://github.com/earendil-works/pi/tree/main/packages/agent/examples/mcp-codemode) does. That example also rejects failed nested calls inside the script and combines codemode with MCP tools.
+Text and image items already have the shape of `@earendil-works/pi-ai` content. Observation items contain data and must be rendered before passing them to a provider. Calling `tool.execute()` directly skips the agent's `beforeToolCall` and `afterToolCall` hooks. To apply them to nested calls too, run each call through `runToolCall()` from `@earendil-works/pi-agent-core`, as the [mcp-codemode example](https://github.com/earendil-works/pi/tree/main/packages/agent/examples/mcp-codemode) does. That example also rejects failed nested calls inside the script and combines codemode with MCP tools.
 
 ## Results
 
@@ -187,7 +208,7 @@ const codemodeTool: AgentTool = {
 | `aborted` | `options.signal` fired or `close()` was called; the worker was terminated   |
 | `sandbox` | the worker or VM failed, for example a wasm trap or a missing worker file   |
 
-`result.output` holds the text and image items in the order the script produced them, also for failed executions. The host keeps all of it until the script ends, so output is limited to `MAX_OUTPUT_CHARS` (16 Mi) characters of text and base64 image data and `MAX_OUTPUT_ITEMS` (100000) items. Past either limit the script fails with a `RangeError`, even if it catches the error. `result.calls` lists every tool call with `status: "ok" | "error" | "cancelled"`. A call that is still running when the script returns (not awaited) is aborted through the tool's `signal` and reported as `cancelled`.
+`result.output` holds text, image and observation items in the order the script produced them, also for failed executions. The host keeps all of it until the script ends, so output is limited to `MAX_OUTPUT_CHARS` (16 Mi) characters of text, serialized observations and base64 image data and `MAX_OUTPUT_ITEMS` (100000) items. Past either limit the script fails with a `RangeError`, even if it catches the error. `result.calls` lists every tool call with `status: "ok" | "error" | "cancelled"`. A call that is still running when the script returns (not awaited) is aborted through the tool's `signal` and reported as `cancelled`.
 
 ## How it works
 
@@ -203,4 +224,5 @@ The worker keeps script execution off the host thread: QuickJS runs synchronousl
 
 - Works the same on Node and Bun, including memory limits, interrupts, and a catchable `RangeError` for deep recursion (QuickJS's stack guard is enabled; without it the wasm stack overflows and traps).
 - Stack traces use QuickJS frames (`at f (codemode.js:2:31)`), prefixed with `Name: message` like V8. The wrapper prefix shares line 1 with the script, so line numbers are exact; column numbers on line 1 are shifted.
+- Rejected tool and host calls retain their source call site, including a module's filename and line. The bridge captures it before the async host operation starts, so errors point to the caller instead of the internal promise settlement code.
 - QuickJS is an interpreter. Glue code and filtering tool results are fast enough; heavy computation is slower than in V8.

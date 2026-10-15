@@ -53,6 +53,7 @@ async function main(data: WorkerData): Promise<void> {
 	const interrupt = new Int32Array(data.interrupt);
 	const vm = await QuickJS.create({
 		wasm: data.wasm,
+		extensions: [{ name: "encoding", wasm: data.encodingWasm }],
 		memoryLimit: data.memoryLimitBytes,
 		// Without a guard, deep recursion overflows the wasm stack and traps instead of throwing a
 		// catchable RangeError.
@@ -75,6 +76,10 @@ async function main(data: WorkerData): Promise<void> {
 				});
 				break;
 			case "output":
+				if (a.toString() === "observation") {
+					post({ type: "observation", json: b.toString() });
+					break;
+				}
 				post({
 					type: "output",
 					item:
@@ -114,6 +119,7 @@ async function main(data: WorkerData): Promise<void> {
 				vm.newString(JSON.stringify(data.tools)),
 				vm.newString(JSON.stringify(data.globals)),
 				vm.newString(JSON.stringify(data.store)),
+				data.data === undefined ? vm.undefined : vm.newString(data.data),
 			),
 		),
 	);
@@ -167,7 +173,9 @@ async function main(data: WorkerData): Promise<void> {
 			drain();
 			return;
 		}
-		fn = vm.evalCode(`(async (tools, console) => {${data.code}\n})`, "codemode.js");
+		// Capabilities live in the outer global scope. Local declarations may shadow them,
+		// just like ordinary JavaScript, without colliding with invisible parameters.
+		fn = vm.evalCode(`(async () => {${data.code}\n})`, "codemode.js");
 	} catch (error) {
 		if (!(error instanceof JSException)) throw error;
 		post({ type: "done", ok: false, error: describeException(error) });

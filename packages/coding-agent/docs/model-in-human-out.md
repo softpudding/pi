@@ -1,6 +1,14 @@
 # Model in, Human out
 
-Status: explicit loop control, host filesystem/process primitives, versioned source modules, dynamic tool registration/removal, four event hooks, and branch-persistent state are implemented experimentally in pi-mih. See [the implemented API](codemode.md). Custom compaction and general context hooks remain explorations. The sections below preserve the design rationale; the API document defines current behavior.
+Status: the editable Harness framework is implemented experimentally in pi-mih. It includes file-defined internal tools/hooks, branch-persistent definitions and state, editable system/codemode/history/loop/output rules, custom compaction policies and explicit version activation. See [the implemented API](codemode.md) and [the representation and Pi migration map](editable-harness.md).
+
+The explorations below preserve the earlier design rationale. Their fixed-description, append-only-prefix and mandatory codemode final-answer proposals describe the initial prototype, not the current contract. The new definition can deliberately change context presentation; every request records its revision and sources. The former module/registration APIs have been replaced by Harness file editing.
+
+Current internal tools return data directly, and `outputSchema` only validates that data. Loop rules receive concrete execution/protocol outcomes, errors and completed operations, with independent editable recovery budgets. These contracts supersede the initial envelope conversion and shared correction budget described in earlier experiments.
+
+The single codemode tool now accepts `{code, data?}` or `{finish}`. Source modules, prompt text and file content can travel as data, available through the script's outer `data` binding. Final text travels through `finish` without JavaScript string encoding. Programmatic `return loop.finish(value)` remains available; both forms select the same explicit finish outcome. This supersedes the source-only input described in the initial experiment below.
+
+The default Harness also accepts a normal nonempty assistant answer without tool calls. The host reports `assistant_finish` and its text to the editable loop rule; the rule chooses whether to accept it or continue. This deliberately restores the ordinary final-answer convention while retaining executable next/finish decisions inside scripts. Empty and truncated responses still require recovery. The earlier blanket rejection of assistant prose is no longer the default policy.
 
 ## Thesis
 
@@ -118,7 +126,7 @@ This changes the execution contract, not just the prompt. In this mode, a text-o
 
 Current models may still emit a conventional final answer without calling codemode. Instructions and examples must teach explicit completion. A missing or invalid decision should produce a bounded corrective inference asking for a valid control return; exhausting that recovery budget reports a protocol error, not successful completion. Silently treating prose as `finish` would restore the old rule.
 
-A script exception or missing control return commits no loop decision. Existing output and store-success rules remain unchanged; the correction is a separate appended message, not a replacement tool result. Allow three consecutive corrections, then abort with a visible protocol error. Do not automatically rerun a script whose tools may already have changed the outside world. Truncated model-generated scripts must not execute. Cancellation and provider failures do not trigger protocol corrections.
+A script exception or missing control return commits no loop decision. Existing output and store-success rules remain unchanged; recovery is a separate appended message, not a replacement tool result. The current default allows three execution recoveries and three protocol corrections independently, resetting on a valid decision. Execution failures include the actual error and completed operations; only missing decisions and invalid call shapes receive protocol reminders. Do not automatically rerun a script whose tools may already have changed the outside world. Truncated model-generated scripts must not execute. Cancellation and provider failures do not trigger recovery corrections.
 
 The harness still implements execution, validation, recovery, permission checks, budgets, and interruption. What moves to the model is the ordinary decision to continue or finish. Recovery is an exceptional protocol repair, not a competing task strategy. This experiment does not change the authority of user input or trusted host extensions.
 

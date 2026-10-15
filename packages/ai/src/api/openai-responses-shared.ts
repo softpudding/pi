@@ -35,7 +35,7 @@ import { shortHash } from "../utils/hash.ts";
 import { parseStreamingJson } from "../utils/json-parse.ts";
 import { sanitizeSurrogates } from "../utils/sanitize-unicode.ts";
 import { getSystemMessageText, renderSystemMessageUpdate } from "../utils/text.ts";
-import { resolveTranscript, resolveTranscriptTools } from "../utils/transcript.ts";
+import { getDeclaredTools, resolveTranscript, resolveTranscriptTools } from "../utils/transcript.ts";
 import {
 	appendGrammarToolInputJsonDelta,
 	type GrammarToolInputJsonBuffer,
@@ -150,6 +150,9 @@ export function convertResponsesMessages<TApi extends Api>(
 ): ResponseInput {
 	const normalizedContext = resolveTranscript(context, options?.supportsMidConvoSystemMessages);
 	const messages: ResponseInput = [];
+	const toolConfigs = new Map(
+		getDeclaredTools(normalizedContext.messages).map((tool) => [tool.name, tool.constrainedSampling]),
+	);
 
 	const normalizeIdPart = (part: string): string => {
 		const sanitized = part.replace(/[^a-zA-Z0-9_-]/g, "_");
@@ -311,7 +314,12 @@ export function convertResponsesMessages<TApi extends Api>(
 							call_id: callId,
 							name: toolCall.name,
 							input: sanitizeSurrogates(
-								getGrammarToolInput(toolCall.name, toolCall.arguments, customInputProperty),
+								getGrammarToolInput(
+									toolCall.name,
+									toolCall.arguments,
+									customInputProperty,
+									toolConfigs.get(toolCall.name),
+								),
 							),
 							...(isSameModel && toolCall.namespace !== undefined ? { namespace: toolCall.namespace } : {}),
 						} satisfies ResponseOutputItem);

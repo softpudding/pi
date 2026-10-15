@@ -1,0 +1,5 @@
+envelope: 'Optionally submit a JSON object containing {code,data?} or {finish}, with exactly one of code or finish.'
+parameters:
+  code: 'JavaScript async function body. Top-level await and return work. Mutually exclusive with finish.'
+  data: 'Optional object supplied alongside code in the same call, available as the outer data binding for that invocation only. Document strings contain the intended text with only JSON encoding: preserve their quotes, backslashes, template literals and newlines; do not add JavaScript string escaping. Definitions and schemas can be objects. Do not serialize data itself into a string.'
+  finish: 'Final answer as text data; ends the task without executing JavaScript. Mutually exclusive with code and data.'

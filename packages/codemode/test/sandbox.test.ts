@@ -585,7 +585,7 @@ describe("limits and lifetime", () => {
 	// #10283: the host keeps all output, so a script that prints in a loop must not grow it without bound.
 	it("fails a script whose output passes the limits, even if it catches the error", async () => {
 		const sandbox = createSandbox();
-		for (const print of ["text(s)", "console.log(s)", 'image("data:image/png;base64," + p)']) {
+		for (const print of ["text(s)", "observe({source:s})", "console.log(s)", 'image("data:image/png;base64," + p)']) {
 			const result = await sandbox.execute(`
 				const s = "x".repeat(1 << 20);
 				const p = "iVBORw0KGgoA" + "A".repeat(1 << 20);
@@ -595,10 +595,10 @@ describe("limits and lifetime", () => {
 				ok: false,
 				error: { kind: "script", name: "RangeError", message: expect.stringContaining("script output exceeded") },
 			});
-			const chars = result.output.reduce(
-				(sum, item) => sum + (item.type === "text" ? item.text.length : item.data.length),
-				0,
-			);
+			const chars = result.output.reduce((sum, item) => {
+				if (item.type === "observation") return sum + JSON.stringify({ value: item.value }).length;
+				return sum + (item.type === "text" ? item.text.length : item.data.length);
+			}, 0);
 			expect(chars).toBeLessThanOrEqual(MAX_OUTPUT_CHARS);
 			expect(chars).toBeGreaterThan(MAX_OUTPUT_CHARS - (2 << 20));
 		}

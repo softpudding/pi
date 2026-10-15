@@ -1,0 +1,10 @@
+# Initial enabled/reserveTokens/keepRecentTokens are imported from effective session settings.
+enabled: true
+reserveTokens: 16384
+keepRecentTokens: 20000
+summaryFraction: 0.8
+turnFraction: 0.5
+branchMaxTokens: 4096
+branchReserveTokens: 16384
+toolResultMaxChars: 2000
+toolCallMaxChars: 8000

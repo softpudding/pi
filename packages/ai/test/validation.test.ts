@@ -61,6 +61,47 @@ describe("validateToolArguments", () => {
 		}
 	});
 
+	it("reports argument shapes without echoing or decoding serialized source documents", () => {
+		const tool: Tool = {
+			name: "codemode",
+			description: "Run code with data",
+			parameters: Type.Object({ code: Type.String(), data: Type.Object({}) }),
+		};
+		const source = 'const text = "quotes and \\n";\n'.repeat(1000);
+		const toolCall: ToolCall = {
+			type: "toolCall",
+			id: "invalid-data",
+			name: "codemode",
+			arguments: { code: source, data: JSON.stringify({ source }) },
+		};
+		const original = structuredClone(toolCall.arguments);
+		let message = "";
+		try {
+			validateToolArguments(tool, toolCall);
+		} catch (error) {
+			message = error instanceof Error ? error.message : String(error);
+		}
+		expect(message).toContain("data: must be object");
+		expect(message).toContain(`code: string (${source.length} characters)`);
+		expect(message).toContain("data: string");
+		expect(message).not.toContain("const text");
+		expect(message.length).toBeLessThan(500);
+		expect(toolCall.arguments).toEqual(original);
+	});
+
+	it("bounds large validation failures while retaining small literal values", () => {
+		const properties = Object.fromEntries(Array.from({ length: 40 }, (_, i) => [`field${i}`, Type.Number()]));
+		const tool: Tool = { name: "numbers", description: "Numbers", parameters: Type.Object(properties) };
+		const toolCall: ToolCall = {
+			type: "toolCall",
+			id: "invalid-fields",
+			name: tool.name,
+			arguments: Object.fromEntries(Object.keys(properties).map((key) => [key, 'literal "quote"\n\\n'])),
+		};
+		expect(() => validateToolArguments(tool, toolCall)).toThrow('literal "quote"\n\\n');
+		expect(() => validateToolArguments(tool, toolCall)).toThrow("additional argument fields");
+	});
+
 	it("coerces serialized plain JSON schemas with AJV-compatible primitive rules", () => {
 		const passingCases: Array<{
 			schema: Tool["parameters"];

@@ -67,6 +67,10 @@ export interface ReadToolOptions {
 	resizeOptions?: ModelImageResizeOptions;
 	/** Custom operations for file reading. Default: local filesystem */
 	operations?: ReadOperations;
+	/** Resolve paths in a non-filesystem backend without probing the local disk. */
+	resolvePath?: (path: string, cwd: string) => string | Promise<string>;
+	/** Backend-specific diagnostic for a line that cannot fit in the read window. */
+	longLineHint?: string;
 }
 
 /** The image block and its note, or the text for text files and images that could not be processed. */
@@ -121,7 +125,7 @@ export function createReadToolDefinition(
 
 					(async () => {
 						try {
-							const absolutePath = await resolveReadPathAsync(path, ctx?.cwd || cwd);
+							const absolutePath = await (options?.resolvePath ?? resolveReadPathAsync)(path, ctx?.cwd || cwd);
 							if (aborted) return;
 							// Check if file exists and is readable.
 							await ops.access(absolutePath);
@@ -179,7 +183,10 @@ export function createReadToolDefinition(
 								if (truncation.firstLineExceedsLimit) {
 									// First line alone exceeds the byte limit. Point the model at a bash fallback.
 									const firstLineSize = formatSize(Buffer.byteLength(allLines[startLine], "utf-8"));
-									outputText = `[Line ${startLineDisplay} is ${firstLineSize}, exceeds ${formatSize(DEFAULT_MAX_BYTES)} limit. Use bash: sed -n '${startLineDisplay}p' ${path} | head -c ${DEFAULT_MAX_BYTES}]`;
+									const hint =
+										options?.longLineHint ??
+										`Use bash: sed -n '${startLineDisplay}p' ${path} | head -c ${DEFAULT_MAX_BYTES}`;
+									outputText = `[Line ${startLineDisplay} is ${firstLineSize}, exceeds ${formatSize(DEFAULT_MAX_BYTES)} limit. ${hint}]`;
 									details = { truncation };
 								} else if (truncation.truncated) {
 									// Truncation occurred. Build an actionable continuation notice.

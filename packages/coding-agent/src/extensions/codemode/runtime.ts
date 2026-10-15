@@ -1,122 +1,76 @@
-/** Branch-persistent model programs and their tool/event bindings. */
+/** Execute model-owned tools against immutable Harness definitions. */
 import { AsyncLocalStorage } from "node:async_hooks";
-import { createHash } from "node:crypto";
-import type { AgentToolResult } from "@earendil-works/pi-agent-core";
-import { CodemodeSandbox, type CodemodeTool, loadQuickJSWasm } from "@earendil-works/pi-codemode";
-import { type TSchema, Type } from "typebox";
-import { Check } from "typebox/value";
-import { getCodemodeWorkerSpecifier, getQuickJSWasmPath } from "../../config.ts";
+import { randomUUID } from "node:crypto";
+import type { AgentMessage, AgentTool, AgentToolResult } from "@earendil-works/pi-agent-core";
+import { toToolDeclaration } from "@earendil-works/pi-ai";
+import {
+	type CodemodeOutputItem,
+	CodemodeSandbox,
+	type CodemodeTool,
+	loadQuickJSEncoding,
+	loadQuickJSWasm,
+} from "@earendil-works/pi-codemode";
+import { Check, Errors } from "typebox/value";
+import { stringify } from "yaml";
+import { getCodemodeWorkerSpecifier, getQuickJSEncodingPath, getQuickJSWasmPath } from "../../config.ts";
+import type { CompactionPreparation } from "../../core/compaction/compaction.ts";
 import type {
 	ExtensionAPI,
 	ExtensionContext,
-	ExtensionToolContext,
 	ToolCallEventResult,
 	ToolResultEventResult,
 } from "../../core/extensions/types.ts";
 import type { SessionEntry } from "../../core/session-manager.ts";
+import { SettingsManager } from "../../core/settings-manager.ts";
+import { ATOMIC_CODEMODE_API, HARNESS_DEFINITION_REFERENCE } from "./api.ts";
+import { bindHostContract } from "./contracts.ts";
+import type { HarnessExecutor } from "./harness/bridge.ts";
+import {
+	compactWithHarness,
+	type HarnessCompactionPlan,
+	planCompaction,
+	type SummaryExecutor,
+	summarizeBranchWithHarness,
+} from "./harness/compaction.ts";
+import {
+	digest,
+	evaluate,
+	fileText,
+	type Handler,
+	type HarnessSnapshot,
+	type HookEvent,
+	loadDefaultFiles,
+	type Provenance,
+	runRule,
+	yamlValue,
+} from "./harness/definition.ts";
+import type { HarnessRequestRecord } from "./harness/inspection.ts";
+import { contentSchema, renderHarnessOutput } from "./harness/output.ts";
+import { HARNESS_REQUEST_ENTRY, type HarnessPreview, HarnessStore } from "./harness/store.ts";
+import { parameterDescriptions } from "./input.ts";
 import { integer, object, PrimitiveScope, string } from "./primitives.ts";
+import type { CodemodeNestedCall } from "./tool.ts";
 
-export const CODEMODE_RUNTIME_ENTRY = "codemode-runtime";
-const MAX_SOURCE_CHARS = 256 * 1024;
-const MAX_RUNTIME_CHARS = 4 * 1024 * 1024;
-
-interface ModuleRef {
-	module: string;
-	revision: string;
-	export: string;
-}
-interface ModuleDefinition {
-	id: string;
-	revision: string;
-	source: string;
-	exports: string[];
-}
-interface RuntimeTool {
-	name: string;
-	description: string;
-	parameters: TSchema;
-	outputSchema?: TSchema;
-	handler: ModuleRef;
-}
-type HookEvent = "tool_call" | "tool_result" | "agent_start" | "agent_end";
-interface RuntimeHook {
-	id: string;
-	event: HookEvent;
-	handler: ModuleRef;
-}
-interface RegistryChanges {
-	tools: RuntimeTool[];
-	removeTools: string[];
-	hooks: RuntimeHook[];
-	removeHooks: string[];
-}
-type RuntimeChange =
-	| { type: "module"; value: ModuleDefinition }
-	| { type: "registry"; value: RegistryChanges }
-	| { type: "remove-module"; id: string }
-	| { type: "state"; scope: string; key: string; value?: unknown };
-
-interface RuntimeState {
-	modules: Map<string, ModuleDefinition>;
-	tools: Map<string, RuntimeTool>;
-	hooks: Map<string, RuntimeHook>;
-	values: Map<string, unknown>;
-}
-
-function emptyState(): RuntimeState {
-	return { modules: new Map(), tools: new Map(), hooks: new Map(), values: new Map() };
-}
-
-function apply(state: RuntimeState, change: RuntimeChange): void {
-	switch (change.type) {
-		case "module":
-			state.modules.set(`${change.value.id}@${change.value.revision}`, change.value);
-			break;
-		case "registry":
-			for (const name of change.value.removeTools) state.tools.delete(name);
-			for (const id of change.value.removeHooks) state.hooks.delete(id);
-			for (const tool of change.value.tools) state.tools.set(tool.name, tool);
-			for (const hook of change.value.hooks) state.hooks.set(hook.id, hook);
-			break;
-		case "remove-module":
-			for (const [key, module] of state.modules) if (module.id === change.id) state.modules.delete(key);
-			for (const [key, tool] of state.tools) if (tool.handler.module === change.id) state.tools.delete(key);
-			for (const [key, hook] of state.hooks) if (hook.handler.module === change.id) state.hooks.delete(key);
-			for (const key of state.values.keys()) if (key.startsWith(`${change.id}\0`)) state.values.delete(key);
-			break;
-		case "state":
-			if (change.value === undefined) state.values.delete(`${change.scope}\0${change.key}`);
-			else state.values.set(`${change.scope}\0${change.key}`, change.value);
-			break;
-	}
-}
-
-function identifier(value: unknown, field: string): string {
-	const name = string(value, field);
-	if (!/^[a-zA-Z][a-zA-Z0-9_.-]{0,127}$/.test(name)) throw new Error(`${field} must be a short identifier`);
-	return name;
-}
-
-const contentSchema = Type.Array(
-	Type.Union([
-		Type.Object({ type: Type.Literal("text"), text: Type.String() }),
-		Type.Object({ type: Type.Literal("image"), data: Type.String(), mimeType: Type.String() }),
-	]),
-);
-
-function toolResult(value: unknown): AgentToolResult<unknown> {
-	const result = object(value);
-	if (!Check(contentSchema, result.content))
-		throw new Error('Tool must return { content: [{ type: "text", text: "..." }], details, structuredContent? }');
-	if (result.isError !== undefined && typeof result.isError !== "boolean") throw new Error("isError must be boolean");
-	return {
-		content: result.content,
-		details: result.details,
-		...(result.structuredContent !== undefined
-			? { structuredContent: result.structuredContent as AgentToolResult<unknown>["structuredContent"] }
-			: {}),
-		...(result.isError === true ? { isError: true } : {}),
-	};
+export interface HarnessLoopOutcome {
+	status:
+		| "next"
+		| "finish"
+		| "assistant_finish"
+		| "execution_failed"
+		| "missing_decision"
+		| "invalid_batch"
+		| "invalid_tool";
+	/** Native final text, provided only for a normally completed assistant response without tools. */
+	text?: string;
+	toolCalls: { id: string; name: string }[];
+	results: {
+		toolCallId: string;
+		toolName: string;
+		isError: boolean;
+		loopControl?: "next" | "finish";
+		error?: { kind: string; name?: string; message: string; stack?: string };
+		calls: CodemodeNestedCall[];
+	}[];
 }
 
 export type RuntimeRecord = (name: string, args: unknown, execute: () => Promise<unknown>) => Promise<unknown>;
@@ -124,183 +78,442 @@ interface Invocation {
 	ctx: ExtensionContext;
 	depth: number;
 	module: string;
+	parentId: string;
+	request: string;
+	requestId?: string;
+	snapshot?: HarnessSnapshot;
 	record?: RuntimeRecord;
 	modelGlobals: CodemodeTool[];
 }
+interface Rendered extends HarnessPreview {
+	system: { id: string; text: string }[];
+	history: AgentMessage[];
+	provenance: Provenance[];
+}
+
+/** Validate relations after projection; never send a dangling or reordered tool result. */
+function validateHistory(value: unknown): AgentMessage[] {
+	if (!Array.isArray(value)) throw new Error("context.history must return an array of messages");
+	const pending = new Set<string>();
+	for (const item of value) {
+		const message = object(item);
+		if (!["system", "user", "assistant", "toolResult"].includes(String(message.role)))
+			throw new Error(`Invalid projected role: ${message.role}`);
+		if (message.toolsAdded !== undefined || message.toolsRemoved !== undefined || message.sections !== undefined)
+			throw new Error("History rules cannot declare provider tools or system sections");
+		if (typeof message.content !== "string" && !Array.isArray(message.content))
+			throw new Error("Projected message needs content");
+		if (message.role === "toolResult") {
+			const id = string(message.toolCallId, "toolCallId");
+			if (!pending.delete(id)) throw new Error(`Orphan projected tool result ${id}`);
+		} else if (message.role !== "system") {
+			if (pending.size) throw new Error("History projection separated a tool call from its results");
+			if (message.role === "assistant" && Array.isArray(message.content)) {
+				for (const part of message.content)
+					if (part.type === "toolCall") pending.add(string(part.id, "tool call id"));
+			}
+		}
+	}
+	if (pending.size) throw new Error("History projection omitted tool results");
+	return value as AgentMessage[];
+}
 
 export class CodemodeRuntime {
+	readonly harness: HarnessStore;
 	private readonly pi: ExtensionAPI;
-	private state = emptyState();
-	private lastEntry: string | undefined;
-	private readonly ownedTools = new Map<string, RuntimeTool>();
-	private readonly subscriptions = new Map<string, () => void>();
-	private readonly active = new Map<string, { controller: AbortController; handler: ModuleRef }>();
 	private readonly invocation = new AsyncLocalStorage<Invocation>();
+	private readonly active = new Map<string, { controller: AbortController; handler: Handler; revision: string }>();
+	private readonly subscriptions: (() => void)[] = [];
+	private readonly toolCache = new Map<string, AgentTool[]>();
+	private sources: Record<string, unknown> = {};
+	private readonly modelAPI: string;
+	private executor?: HarnessExecutor;
 	private nextHookCall = 0;
+	private currentCtx?: ExtensionContext;
+	private closed = false;
 
-	constructor(pi: ExtensionAPI) {
+	constructor(pi: ExtensionAPI, models = true) {
 		this.pi = pi;
-	}
-
-	/** Rebuild definitions only; replay never invokes a module or repeats external effects. */
-	sync(ctx: ExtensionContext): void {
-		const entries = ctx.sessionManager
-			.getBranch()
-			.filter((entry) => entry.type === "custom" && entry.customType === CODEMODE_RUNTIME_ENTRY);
-		const last = entries.at(-1)?.id;
-		if (last === this.lastEntry) return;
-		const state = emptyState();
-		for (const entry of entries) if (entry.type === "custom") apply(state, entry.data as RuntimeChange);
-		this.state = state;
-		this.lastEntry = last;
-		this.refresh();
-	}
-
-	private commit(change: RuntimeChange, ctx: ExtensionContext): void {
-		this.sync(ctx);
-		const next: RuntimeState = {
-			modules: new Map(this.state.modules),
-			tools: new Map(this.state.tools),
-			hooks: new Map(this.state.hooks),
-			values: new Map(this.state.values),
-		};
-		apply(next, change);
-		if (JSON.stringify([...next.modules, ...next.tools, ...next.hooks, ...next.values]).length > MAX_RUNTIME_CHARS)
-			throw new Error("Codemode runtime exceeds 4 MiB; remove unused modules or state");
-		this.pi.appendEntry(CODEMODE_RUNTIME_ENTRY, change);
-		this.state = next;
-		this.lastEntry = ctx.sessionManager.getBranch().at(-1)?.id;
-		if (change.type === "registry" || change.type === "remove-module") this.refresh();
-	}
-
-	private reference(value: unknown): ModuleRef {
-		const ref = object(value);
-		const handler = {
-			module: identifier(ref.module, "handler.module"),
-			revision: string(ref.revision, "handler.revision"),
-			export: string(ref.export, "handler.export"),
-		};
-		const module = this.state.modules.get(`${handler.module}@${handler.revision}`);
-		if (!module || !module.exports.includes(handler.export))
-			throw new Error("Handler must reference a saved module revision and a callable export");
-		return handler;
-	}
-
-	private parseTool(input: unknown): RuntimeTool {
-		const args = object(input);
-		const handler = this.reference(args.handler);
-		const name = identifier(args.name, "name");
-		if (!name.startsWith(`${handler.module}.`)) throw new Error(`Tool name must start with ${handler.module}.`);
-		if (!this.ownedTools.has(name) && this.pi.getAllTools().some((tool) => tool.name === name))
-			throw new Error(`Tool ${name} is owned by another extension`);
-		const parameters = object(args.parameters);
-		if (parameters.type !== "object") throw new Error("parameters must be an object JSON Schema");
-		return {
-			name,
-			description: string(args.description, "description"),
-			parameters: parameters as TSchema,
-			...(args.outputSchema === undefined ? {} : { outputSchema: object(args.outputSchema) as TSchema }),
-			handler,
-		};
-	}
-
-	private parseHook(input: unknown): RuntimeHook {
-		const args = object(input);
-		const handler = this.reference(args.handler);
-		const id = identifier(args.id, "id");
-		if (!id.startsWith(`${handler.module}.`)) throw new Error(`Hook id must start with ${handler.module}.`);
-		if (
-			args.event !== "tool_call" &&
-			args.event !== "tool_result" &&
-			args.event !== "agent_start" &&
-			args.event !== "agent_end"
-		)
-			throw new Error("Supported events: tool_call, tool_result, agent_start, agent_end");
-		return { id, event: args.event, handler };
-	}
-
-	private refresh(): void {
-		for (const [name, tool] of this.ownedTools) {
-			if (!this.state.tools.has(name))
-				this.pi.registerTool({
-					name,
-					label: name,
-					description: tool.description,
-					parameters: tool.parameters,
-					exposure: "hidden",
-					execute: async () => {
-						throw new Error(`Tool ${name} was unregistered`);
-					},
+		this.modelAPI = models
+			? "\nModel primitives: models.getAvailableOfType(type,provider?), models.getModelsOfType(type,provider?), models.getModelOfType(type,provider,id), models.classify(model,context), models.generateImages(model,context). Types: chat, classifier, image. Model credentials stay on the host. These globals also work in tool handlers. See docs/codemode.md for context schemas."
+			: "";
+		this.harness = new HarnessStore(
+			(type, data) => pi.appendEntry(type, data),
+			() => {
+				const files = loadDefaultFiles();
+				const manager = SettingsManager.inMemory(pi.getSettings());
+				const settings = manager.getCompactionSettings(this.currentCtx?.model);
+				files["policies/compaction.yaml"] = stringify({
+					...object(yamlValue(files["policies/compaction.yaml"], "policies/compaction.yaml")),
+					...settings,
+					branchReserveTokens: manager.getBranchSummarySettings().reserveTokens,
 				});
-		}
-		for (const tool of this.state.tools.values()) {
-			this.ownedTools.set(tool.name, tool);
-			this.pi.registerTool({
-				name: tool.name,
-				label: tool.name,
-				description: tool.description,
-				parameters: tool.parameters,
-				outputSchema: tool.outputSchema,
-				exposure: "deferred",
-				defaultActive: false,
-				execute: async (id, args, signal, _onUpdate, ctx) => {
-					if (!ctx) throw new Error("Generated tools need a session");
-					const value = toolResult(await this.run(tool.handler, [args], ctx, signal, id));
-					if (tool.outputSchema && !value.isError && !Check(tool.outputSchema, value.structuredContent))
-						throw new Error("structuredContent does not match outputSchema");
-					return value;
-				},
-			});
-		}
-		for (const unsubscribe of this.subscriptions.values()) unsubscribe();
-		this.subscriptions.clear();
-		for (const hook of this.state.hooks.values()) {
-			const run = (event: unknown, ctx: ExtensionContext) =>
-				this.run(hook.handler, [event], ctx, ctx.signal, `hook:${hook.id}:${++this.nextHookCall}`);
-			let unsubscribe: () => void;
-			switch (hook.event) {
-				case "tool_call":
-					unsubscribe = this.pi.on("tool_call", async (event, ctx) => {
-						const value = await run(event, ctx);
-						if (value === undefined || value === null) return;
-						const result = object(value);
-						if (result.block !== undefined && typeof result.block !== "boolean")
-							throw new Error("tool_call hook block must be boolean");
-						if (result.reason !== undefined && typeof result.reason !== "string")
-							throw new Error("tool_call hook reason must be string");
-						return { block: result.block, reason: result.reason } as ToolCallEventResult;
-					});
-					break;
-				case "tool_result":
-					unsubscribe = this.pi.on("tool_result", async (event, ctx) => {
-						const value = await run(event, ctx);
-						if (value === undefined || value === null) return;
-						const result = object(value);
-						if (result.content !== undefined && !Check(contentSchema, result.content))
-							throw new Error("Invalid tool_result hook content");
-						if (result.isError !== undefined && typeof result.isError !== "boolean")
-							throw new Error("Invalid tool_result isError");
-						return {
-							content: result.content,
-							details: result.details,
-							structuredContent: result.structuredContent,
-							isError: result.isError,
-						} as ToolResultEventResult;
-					});
-					break;
-				case "agent_start":
-					unsubscribe = this.pi.on("agent_start", async (event, ctx) => {
-						await run(event, ctx);
-					});
-					break;
-				case "agent_end":
-					unsubscribe = this.pi.on("agent_end", async (event, ctx) => {
-						await run(event, ctx);
-					});
-					break;
+				return files;
+			},
+			async (snapshot, signal) => {
+				const { history: _history, ...preview } = await this.render(snapshot, signal);
+				return preview;
+			},
+		);
+		this.subscriptions.push(
+			pi.on(
+				"tool_call",
+				async (event, ctx) => this.hooks("tool_call", event, ctx) as Promise<ToolCallEventResult | undefined>,
+			),
+		);
+		this.subscriptions.push(
+			pi.on(
+				"tool_result",
+				async (event, ctx) => this.hooks("tool_result", event, ctx) as Promise<ToolResultEventResult | undefined>,
+			),
+		);
+		this.subscriptions.push(
+			pi.on("agent_start", async (event, ctx) => {
+				await this.hooks("agent_start", event, ctx);
+			}),
+		);
+		this.subscriptions.push(
+			pi.on("agent_end", async (event, ctx) => {
+				await this.hooks("agent_end", event, ctx);
+			}),
+		);
+	}
+
+	async sync(ctx: ExtensionContext): Promise<void> {
+		if (this.closed) throw new Error("Harness runtime is closed");
+		this.currentCtx = ctx;
+		await this.harness.sync(ctx);
+	}
+
+	bindExecutor(executor: HarnessExecutor): void {
+		this.executor = executor;
+	}
+
+	setSources(sources: Record<string, unknown>): void {
+		this.sources = structuredClone(sources);
+	}
+
+	async compactionPolicy(
+		entries: SessionEntry[],
+		contextTokens: number,
+		contextWindow: number,
+		candidate = false,
+		signal?: AbortSignal,
+		purpose = "compaction",
+	): Promise<{ snapshot: HarnessSnapshot; plan: HarnessCompactionPlan }> {
+		const snapshot = await this.harness.snapshot(
+			candidate ? (this.harness.pending?.revision ?? this.harness.activeRevision) : this.harness.activeRevision,
+		);
+		return { snapshot, plan: await planCompaction(snapshot, entries, contextTokens, contextWindow, signal, purpose) };
+	}
+
+	compact(
+		policy: { snapshot: HarnessSnapshot; plan: HarnessCompactionPlan },
+		preparation: CompactionPreparation,
+		execute: SummaryExecutor,
+		customInstructions?: string,
+		signal?: AbortSignal,
+	) {
+		return compactWithHarness(
+			policy.snapshot,
+			policy.plan,
+			preparation,
+			execute,
+			this.ruleSources(policy.snapshot),
+			customInstructions,
+			signal,
+		);
+	}
+
+	summarizeBranch(
+		policy: { snapshot: HarnessSnapshot; plan: HarnessCompactionPlan },
+		entries: SessionEntry[],
+		execute: SummaryExecutor,
+		customInstructions?: string,
+		replaceInstructions?: boolean,
+		signal?: AbortSignal,
+	) {
+		return summarizeBranchWithHarness(
+			policy.snapshot,
+			policy.plan,
+			entries,
+			execute,
+			this.ruleSources(policy.snapshot),
+			customInstructions,
+			replaceInstructions,
+			signal,
+		);
+	}
+
+	async previewRequest(signal?: AbortSignal): Promise<HarnessPreview> {
+		return this.render(
+			await this.harness.snapshot(this.harness.pending?.revision ?? this.harness.activeRevision),
+			signal,
+		);
+	}
+
+	private ruleSources(snapshot: HarnessSnapshot): Record<string, unknown> {
+		return {
+			...this.sources,
+			"codemode.tools": snapshot.tools.map((tool) => ({ ...tool, revision: snapshot.revision })),
+			"codemode.views": { definitions: snapshot.definition.codemode.output.views.file, handlers: snapshot.views },
+			"host.api-reference": ATOMIC_CODEMODE_API + this.modelAPI,
+			"host.definition-reference": HARNESS_DEFINITION_REFERENCE,
+		};
+	}
+
+	private async render(snapshot: HarnessSnapshot, signal?: AbortSignal): Promise<Rendered> {
+		const sources = this.ruleSources(snapshot);
+		const provenance: Provenance[] = [];
+		const system = await evaluate(
+			snapshot,
+			snapshot.definition.context.system,
+			sources,
+			"system",
+			provenance,
+			signal,
+		);
+		if (
+			!Array.isArray(system) ||
+			!system.every((block) => block && typeof block.id === "string" && typeof block.text === "string")
+		)
+			throw new Error("context.system must return [{id,text}]");
+		if (new Set(system.map((b) => b.id)).size !== system.length) throw new Error("Duplicate system block id");
+		const rawDescription = await evaluate(
+			snapshot,
+			snapshot.definition.codemode.description,
+			sources,
+			"codemode.description",
+			provenance,
+			signal,
+		);
+		const description =
+			typeof rawDescription === "string" ? rawDescription : string(object(rawDescription).text, "description.text");
+		if (!description.trim()) throw new Error("codemode description must not be empty");
+		const descriptions = parameterDescriptions(
+			typeof rawDescription === "string" ? undefined : object(rawDescription).parameterDescriptions,
+		);
+		const history = validateHistory(
+			await evaluate(snapshot, snapshot.definition.context.history, sources, "history", provenance, signal),
+		);
+		const estimatedTokens = Math.ceil(
+			(JSON.stringify(system).length +
+				description.length +
+				JSON.stringify(descriptions ?? {}).length +
+				JSON.stringify(history).length) /
+				4,
+		);
+		return {
+			system,
+			history,
+			description,
+			parameterDescriptions: descriptions,
+			catalog: typeof rawDescription === "string" ? undefined : object(rawDescription).catalog,
+			provenance,
+			inputSnapshot: `i-${digest(sources)}`,
+			estimatedTokens,
+		};
+	}
+
+	async project(
+		ctx: ExtensionContext,
+		codemode: AgentTool,
+		signal?: AbortSignal,
+		commitCheckpoint?: () => void,
+	): Promise<AgentMessage[]> {
+		return this.harness.serialized(async () => {
+			const pending = this.harness.pending;
+			if (pending && pending.expectedActiveRevision !== this.harness.activeRevision)
+				throw new Error("Scheduled Harness activation base changed");
+			const snapshot = await this.harness.snapshot(pending?.revision ?? this.harness.activeRevision);
+			const rendered = await this.render(snapshot, signal);
+			signal?.throwIfAborted();
+			const requestId = `q-${randomUUID()}`;
+			const bootstrap = `Harness request revision: ${snapshot.revision}. Root: agent.yaml. Read its definition inside codemode: observe((await host.harness.read({path:"agent.yaml"})).text). Definitions and state survive history compaction.`;
+			if (rendered.system.some((block) => block.id === "host.bootstrap"))
+				throw new Error("System block ID host.bootstrap is reserved for the request pointer");
+			const content = [...rendered.system.map((block) => block.text), bootstrap].join("\n\n");
+			const parameters = structuredClone(codemode.parameters);
+			for (const name of ["code", "data", "finish"] as const) {
+				const schema = object(object(object(parameters).properties)[name]);
+				delete schema.description;
+				const description = rendered.parameterDescriptions?.[name];
+				if (description !== undefined) schema.description = description;
 			}
-			this.subscriptions.set(hook.id, unsubscribe);
+			const messages: AgentMessage[] = [
+				{
+					role: "system",
+					content,
+					toolsAdded: [toToolDeclaration({ ...codemode, description: rendered.description, parameters })],
+					timestamp: 0,
+				},
+				...rendered.history,
+			];
+			commitCheckpoint?.();
+			if (pending) this.harness.publishPending(snapshot.revision, ctx);
+			const external = object(this.sources["external.contributions"] ?? {});
+			const trace: HarnessRequestRecord = {
+				requestId,
+				revision: snapshot.revision,
+				inputSnapshot: rendered.inputSnapshot,
+				system: [...rendered.system, { id: "host.bootstrap", text: bootstrap }],
+				description: rendered.description,
+				catalog: rendered.catalog,
+				provenance: [
+					...rendered.provenance,
+					{ output: "system/host.bootstrap", dependencies: ["host:request-pointer"] },
+				],
+				estimatedTokens: rendered.estimatedTokens,
+				tokenEstimate: "characters/4",
+				history: rendered.history.map((m) => ({ role: m.role, hash: digest(m) })),
+				historyChars: JSON.stringify(rendered.history).length,
+				externalContributions: { extensions: external.extensions, ownership: external.ownership },
+				hostOwned: [
+					"provider transport, credentials, routing, retries",
+					"VM resource limits and cancellation",
+					"bootstrap revision pointer and top-level codemode schema",
+					"output truncation/spill, image normalization, execution error diagnostics",
+					"native extension code and resource discovery",
+				],
+			};
+			this.pi.appendEntry(HARNESS_REQUEST_ENTRY, { ...trace, sources: this.sources, messages });
+			this.harness.recordRequest(trace);
+			return messages;
+		});
+	}
+
+	async decideLoop(
+		outcome: HarnessLoopOutcome,
+		state: Record<string, unknown>,
+		ctx: ExtensionContext,
+	): Promise<{
+		action: "accept" | "continue" | "stop";
+		state: Record<string, unknown>;
+		text?: string;
+		revision: string;
+		reminder?: string;
+	}> {
+		const snapshot = await this.harness.snapshot(this.harness.requestRevision);
+		const rule = snapshot.definition.loop;
+		const reminders = Object.fromEntries(
+			Object.entries(rule.reminders).map(([name, ref]) => [name, fileText(snapshot.files, ref.file)]),
+		);
+		const value = object(
+			await runRule(
+				snapshot.files,
+				rule.decide,
+				{ outcome, state, reminders },
+				yamlValue(fileText(snapshot.files, rule.options.file), rule.options.file),
+				ctx.signal,
+			),
+		);
+		if (!["accept", "continue", "stop"].includes(String(value.action))) throw new Error("Invalid loop decision");
+		const nextState = object(value.state);
+		if (
+			value.reminder !== undefined &&
+			(typeof value.reminder !== "string" || !Object.hasOwn(reminders, value.reminder))
+		)
+			throw new Error("Unknown loop reminder");
+		if (value.text !== undefined && typeof value.text !== "string") throw new Error("Invalid loop reminder text");
+		return {
+			action: value.action as "accept" | "continue" | "stop",
+			state: nextState,
+			revision: snapshot.revision,
+			reminder: value.reminder as string | undefined,
+			text: (value.text as string | undefined) ?? (value.reminder ? reminders[String(value.reminder)] : undefined),
+		};
+	}
+
+	async renderOutput(
+		output: CodemodeOutputItem[],
+		revision: string,
+		signal?: AbortSignal,
+	): ReturnType<typeof renderHarnessOutput> {
+		const snapshot = await this.harness.snapshot(revision);
+		return renderHarnessOutput(snapshot, output, signal);
+	}
+
+	private tools(snapshot: HarnessSnapshot, ctx: ExtensionContext): AgentTool[] {
+		const cached = this.toolCache.get(snapshot.revision);
+		if (cached) return cached;
+		const tools: AgentTool[] = snapshot.tools.map((tool) => ({
+			name: tool.name,
+			label: tool.name,
+			description: tool.description,
+			parameters: tool.parameters,
+			execute: async (id, args, signal) => {
+				const value = await this.run(
+					snapshot,
+					tool.handler,
+					[args],
+					this.invocation.getStore()?.ctx ?? ctx,
+					signal,
+					id,
+				);
+				if (tool.outputSchema && !Check(tool.outputSchema, value))
+					throw new Error(
+						`${tool.name}: return value does not match outputSchema:\n${Errors(tool.outputSchema, value)
+							.map((error) => `${error.instancePath || "/"}: ${error.message}`)
+							.join("\n")}`,
+					);
+				// Only the native runner/UI needs an envelope. Internal callers receive the value
+				// unchanged, whether or not the definition declares an output schema.
+				return {
+					content: [
+						{ type: "text", text: typeof value === "string" ? value : (JSON.stringify(value) ?? "undefined") },
+					],
+					details: {},
+					structuredContent: value as AgentToolResult<unknown>["structuredContent"],
+				};
+			},
+		}));
+		this.toolCache.set(snapshot.revision, tools);
+		return tools;
+	}
+
+	private async hooks(
+		event: HookEvent,
+		input: unknown,
+		ctx: ExtensionContext,
+	): Promise<Record<string, unknown> | undefined> {
+		if (!this.harness.activeRevision || this.closed) return;
+		const current = this.invocation.getStore();
+		const snapshot =
+			current?.snapshot ??
+			(await this.harness.snapshot(
+				event.startsWith("tool_") ? this.harness.requestRevision : this.harness.activeRevision,
+			));
+		let combined: Record<string, unknown> | undefined;
+		for (const hook of snapshot.hooks.filter((h) => h.event === event)) {
+			const hookInput = { ...object(input), ...combined };
+			const value = await this.run(
+				snapshot,
+				hook.handler,
+				[hookInput],
+				ctx,
+				ctx.signal,
+				`hook:${hook.id}:${++this.nextHookCall}`,
+			);
+			if (value === null || value === undefined) continue;
+			const result = object(value);
+			if (event === "tool_call") {
+				if (result.block !== undefined && typeof result.block !== "boolean")
+					throw new Error("hook.block must be boolean");
+				if (result.reason !== undefined && typeof result.reason !== "string")
+					throw new Error("hook.reason must be string");
+				if (result.block) return { block: true, reason: result.reason };
+			} else if (event === "tool_result") {
+				if (result.content !== undefined && !Check(contentSchema, result.content))
+					throw new Error("Invalid hook content");
+				if (result.isError !== undefined && typeof result.isError !== "boolean")
+					throw new Error("Invalid hook isError");
+				// A presentation-only hook must not erase an internal tool's return value.
+				if (current?.snapshot && result.content !== undefined && result.structuredContent === undefined)
+					result.structuredContent = hookInput.structuredContent;
+				combined = { ...combined, ...result };
+			}
 		}
+		return combined;
 	}
 
 	createScope(
@@ -308,146 +521,92 @@ export class CodemodeRuntime {
 		record?: RuntimeRecord,
 		module = "codemode",
 		modelGlobals?: CodemodeTool[],
+		parentId = "codemode",
+		pinned?: HarnessSnapshot,
 	): { globals: CodemodeTool[]; close: () => void } {
-		this.sync(ctx);
 		const resources = new PrimitiveScope(ctx.cwd);
+		const primitives = resources.globals();
 		const inherited = this.invocation.getStore();
 		const invocation: Invocation = {
-			ctx: "executeTool" in ctx ? ctx : (inherited?.ctx ?? ctx),
+			ctx,
 			depth: (inherited?.depth ?? 0) + 1,
 			module,
+			parentId,
+			request: inherited?.request ?? this.harness.requestRevision,
+			requestId: inherited?.requestId ?? this.harness.requestId,
+			snapshot: pinned,
 			record: record ?? inherited?.record,
 			modelGlobals: modelGlobals ?? inherited?.modelGlobals ?? [],
 		};
 		if (invocation.depth > 32) throw new Error("Generated program call depth exceeds 32");
-		const emptyChanges = (): RegistryChanges => ({ tools: [], removeTools: [], hooks: [], removeHooks: [] });
+		const current = () => (pinned ? Promise.resolve(pinned) : this.harness.snapshot());
 		const methods: Record<string, CodemodeTool["execute"]> = {
-			"host.modules.put": async (input, { signal }) => {
-				const args = object(input);
-				const id = identifier(args.id, "id");
-				const source = string(args.source, "source");
-				if (source.length > MAX_SOURCE_CHARS) throw new Error("Module source exceeds 256 KiB");
-				const revision = createHash("sha256").update(source).digest("hex");
-				const sandbox = this.sandbox([]);
-				try {
-					const result = await sandbox.execute(source, {
-						signal,
-						timeoutMs: 5000,
-						module: { filename: `${id}.mjs` },
-					});
-					if (!result.ok) throw new Error(result.error.stack ?? result.error.message);
-					if (!Array.isArray(result.value) || !result.value.every((name) => typeof name === "string"))
-						throw new Error("Invalid module exports");
-					signal.throwIfAborted();
-					const value: ModuleDefinition = { id, revision, source, exports: result.value };
-					this.commit({ type: "module", value }, ctx);
-					return { id, revision, exports: value.exports };
-				} finally {
-					await sandbox.close();
-				}
-			},
-			"host.modules.list": () =>
-				[...this.state.modules.values()].map(({ source: _source, ...metadata }) => metadata),
-			"host.modules.get": (input) => {
-				const args = object(input);
-				const id = string(args.id, "id");
-				return [...this.state.modules.values()].findLast(
-					(module) => module.id === id && (args.revision === undefined || module.revision === args.revision),
-				);
-			},
-			"host.modules.remove": (input) => {
-				this.commit({ type: "remove-module", id: string(object(input).id, "id") }, ctx);
-			},
-			"host.tools.register": (input) => {
-				const tool = this.parseTool(input);
-				this.commit({ type: "registry", value: { ...emptyChanges(), tools: [tool] } }, ctx);
-				return tool;
-			},
-			"host.tools.unregister": (input) => {
-				const name = string(object(input).name, "name");
-				this.commit({ type: "registry", value: { ...emptyChanges(), removeTools: [name] } }, ctx);
-			},
-			"host.tools.list": () => [...this.state.tools.values()],
-			"host.tools.describe": (input) => this.state.tools.get(string(object(input).name, "name")),
+			"host.tools.list": async () => (await current()).tools,
+			"host.tools.describe": async (input) =>
+				(await current()).tools.find((t) => t.name === string(object(input).name, "name")),
 			"host.tools.call": async (input, { signal }) => {
 				const args = object(input);
 				const name = string(args.name, "name");
-				const tool = this.state.tools.get(name);
-				if (!tool)
+				const snapshot = await current();
+				const tool = snapshot.tools.find((t) => t.name === name);
+				if (!tool) {
+					const primitive = primitives.find((p) => p.name === (name.startsWith("host.") ? name : `host.${name}`));
 					throw new Error(
-						`Unknown generated tool ${name}. Define a module and register its tool first. Built-in and MCP tools are not exposed.`,
+						`Unknown generated tool ${name}. Available tools: ${snapshot.tools.map((t) => t.name).join(", ") || "(none)"}. ` +
+							(primitive
+								? `${primitive.name} is a primitive, not a defined tool. Call ${primitive.name}(args) directly inside a tool handler.`
+								: "Use host.tools.list() for definitions, then host.tools.call({name,args}). Create and activate a Harness tool definition to add a tool."),
 					);
-				const caller = invocation.ctx;
-				if (!("executeTool" in caller))
-					throw new Error("Tool calls require an active codemode or generated tool invocation");
-				const result = await (caller as ExtensionToolContext).executeTool(name, args.args ?? {}, { signal });
+				}
+				if (!this.executor) throw new Error("Internal tool execution requires an active Harness request");
+				const result = await this.invocation.run({ ...invocation, snapshot }, () =>
+					this.executor!(invocation.parentId, name, args.args ?? {}, this.tools(snapshot, ctx), signal),
+				);
 				if (result.isError)
 					throw new Error(
 						result.result.content
-							.filter((part) => part.type === "text")
-							.map((part) => part.text)
+							.filter((p) => p.type === "text")
+							.map((p) => p.text)
 							.join("\n"),
 					);
-				return tool.outputSchema && result.result.structuredContent !== undefined
-					? result.result.structuredContent
-					: result.result.content
-							.filter((part) => part.type === "text")
-							.map((part) => part.text)
-							.join("\n");
+				const value = result.result.structuredContent;
+				if (tool.outputSchema && !Check(tool.outputSchema, value))
+					throw new Error(
+						`${tool.name}: return value after hooks does not match outputSchema:\n${Errors(
+							tool.outputSchema,
+							value,
+						)
+							.map((error) => `${error.instancePath || "/"}: ${error.message}`)
+							.join("\n")}`,
+					);
+				return value;
 			},
-			"host.hooks.register": (input) => {
-				const hook = this.parseHook(input);
-				this.commit({ type: "registry", value: { ...emptyChanges(), hooks: [hook] } }, ctx);
-				return hook;
-			},
-			"host.hooks.unregister": (input) => {
-				this.commit(
-					{ type: "registry", value: { ...emptyChanges(), removeHooks: [string(object(input).id, "id")] } },
-					ctx,
-				);
-			},
-			"host.hooks.list": () => [...this.state.hooks.values()],
-			"host.registry.apply": (input) => {
-				const args = object(input);
-				const list = (value: unknown): unknown[] => {
-					if (value === undefined) return [];
-					if (!Array.isArray(value)) throw new Error("Registry changes must be arrays");
-					return value;
-				};
-				const changes: RegistryChanges = {
-					tools: list(args.tools).map((tool) => this.parseTool(tool)),
-					hooks: list(args.hooks).map((hook) => this.parseHook(hook)),
-					removeTools: list(args.removeTools).map((name) => string(name, "name")),
-					removeHooks: list(args.removeHooks).map((id) => string(id, "id")),
-				};
-				this.commit({ type: "registry", value: changes }, ctx);
-			},
-			"host.state.get": (input) => this.state.values.get(`${module}\0${string(object(input).key, "key")}`),
+			"host.hooks.list": async () => (await current()).hooks,
+			"host.state.get": (input) => this.harness.getState(module, string(object(input).key, "key")),
 			"host.state.set": (input) => {
 				const args = object(input);
-				this.commit({ type: "state", scope: module, key: string(args.key, "key"), value: args.value }, ctx);
+				return this.harness.setState(module, string(args.key, "key"), args.value, ctx);
 			},
-			"host.state.delete": (input) => {
-				this.commit({ type: "state", scope: module, key: string(object(input).key, "key") }, ctx);
-			},
+			"host.state.delete": (input) =>
+				this.harness.setState(module, string(object(input).key, "key"), undefined, ctx),
 			"host.session.history": (input) => {
 				const args = object(input ?? {});
+				const offset = integer(args.offset, "offset", 0);
 				return ctx.sessionManager
 					.getBranch()
-					.filter((entry: SessionEntry) => entry.type === "message")
-					.slice(
-						integer(args.offset, "offset", 0),
-						integer(args.offset, "offset", 0) + integer(args.limit, "limit", 20, 100),
-					);
+					.filter((e) => e.type === "message")
+					.slice(offset, offset + integer(args.limit, "limit", 20, 100));
 			},
-			"host.calls.list": () => [...this.active].map(([id, call]) => ({ id, handler: call.handler })),
+			"host.calls.list": () =>
+				[...this.active].map(([id, call]) => ({ id, handler: call.handler, revision: call.revision })),
 			"host.calls.cancel": (input) => {
 				this.active.get(string(object(input).id, "id"))?.controller.abort();
 			},
 		};
 		const globals = [
-			...resources.globals(),
-			...Object.entries(methods).map(([name, execute]) => ({ name, execute })),
+			...primitives,
+			...this.harness.globals(ctx, invocation.request, invocation.requestId),
+			...Object.entries(methods).map(([name, execute]) => bindHostContract(name, execute)),
 			...invocation.modelGlobals,
 		].map(
 			(global): CodemodeTool => ({
@@ -465,35 +624,31 @@ export class CodemodeRuntime {
 		return { globals, close: () => resources.close() };
 	}
 
-	private sandbox(globals: CodemodeTool[]): CodemodeSandbox {
-		return new CodemodeSandbox({
-			globals,
-			timeoutMs: Number.POSITIVE_INFINITY,
-			memoryLimitBytes: 256 * 1024 * 1024,
-			wasm: loadQuickJSWasm(getQuickJSWasmPath()),
-			workerUrl: getCodemodeWorkerSpecifier(),
-		});
-	}
-
 	private async run(
-		handler: ModuleRef,
+		snapshot: HarnessSnapshot,
+		handler: Handler,
 		args: unknown[],
 		ctx: ExtensionContext,
 		signal: AbortSignal | undefined,
 		id: string,
 	): Promise<unknown> {
-		const module = this.state.modules.get(`${handler.module}@${handler.revision}`);
-		if (!module) throw new Error("Module revision is unavailable");
 		const controller = new AbortController();
 		const combined = signal ? AbortSignal.any([signal, controller.signal]) : controller.signal;
-		const scope = this.createScope(ctx, undefined, module.id);
-		const sandbox = this.sandbox(scope.globals);
-		this.active.set(id, { controller, handler });
+		const scope = this.createScope(ctx, undefined, handler.module, undefined, id, snapshot);
+		const sandbox = new CodemodeSandbox({
+			globals: scope.globals,
+			timeoutMs: Infinity,
+			memoryLimitBytes: 256 * 1024 * 1024,
+			wasm: loadQuickJSWasm(getQuickJSWasmPath()),
+			encodingWasm: loadQuickJSEncoding(getQuickJSEncodingPath()),
+			workerUrl: getCodemodeWorkerSpecifier(),
+		});
+		this.active.set(id, { controller, handler, revision: snapshot.revision });
 		try {
-			const result = await sandbox.execute(module.source, {
+			const result = await sandbox.execute(fileText(snapshot.files, handler.file), {
 				signal: combined,
 				timeoutMs: id.startsWith("hook:") ? 30_000 : undefined,
-				module: { export: handler.export, args, filename: `${module.id}@${module.revision.slice(0, 12)}.mjs` },
+				module: { export: handler.export, args, filename: `${handler.file}@${snapshot.revision.slice(0, 14)}` },
 			});
 			if (!result.ok) throw new Error(result.error.stack ?? result.error.message);
 			return result.value;
@@ -505,8 +660,8 @@ export class CodemodeRuntime {
 	}
 
 	close(): void {
+		this.closed = true;
 		for (const call of this.active.values()) call.controller.abort();
-		for (const unsubscribe of this.subscriptions.values()) unsubscribe();
-		this.subscriptions.clear();
+		for (const unsubscribe of this.subscriptions.splice(0)) unsubscribe();
 	}
 }

@@ -1,0 +1,1 @@
+Submit an object containing {code,data?} or {finish}, with exactly one of code or finish. Prefer operations in code and authored source, prompts, file contents and edit text in data, avoiding another JavaScript string encoding inside JSON. Pass data fields directly to the relevant functions. No Markdown fences.

@@ -9,12 +9,16 @@ import type { CodemodeWasmModule } from "../wasm.ts";
 
 export interface WorkerData {
 	code: string;
+	/** JSON input data, never interpolated into executable source. */
+	data?: string;
 	module?: CodemodeExecuteOptions["module"];
 	/** `jsName` is the identifier the script uses; `description` is listed in `ALL_TOOLS`. */
 	tools: { name: string; jsName: string; description: string }[];
 	globals: { name: string; spread: boolean }[];
 	/** Compiled `quickjs-wasi` module. Structured clone shares the compiled code with the worker. */
 	wasm: CodemodeWasmModule;
+	/** TextEncoder/TextDecoder, loaded inside the VM before built-ins are frozen. */
+	encodingWasm: CodemodeWasmModule;
 	memoryLimitBytes: number | undefined;
 	/** Snapshot for `load()`: key to JSON text. */
 	store: Record<string, string>;
@@ -31,6 +35,8 @@ export type ScriptErrorJson = string;
 export type WorkerToHostMessage =
 	| { type: "call"; id: number; target: "tool" | "global"; name: string; args: string | undefined }
 	| { type: "output"; item: CodemodeOutputItem }
+	/** Snapshot for the host-owned observation channel; the worker never interprets the value. */
+	| { type: "observation"; json: string }
 	/** `writes` is a JSON array of `[key, json]` for `store()` and `[key]` for deletions. */
 	| { type: "done"; ok: true; value: string | undefined; writes: string; loopControl?: CodemodeLoopControl }
 	| { type: "done"; ok: false; error: ScriptErrorJson }
@@ -44,7 +50,7 @@ export type HostToWorkerMessage =
 export function isWorkerToHostMessage(value: unknown): value is WorkerToHostMessage {
 	if (typeof value !== "object" || value === null) return false;
 	const type = (value as { type?: unknown }).type;
-	return type === "call" || type === "output" || type === "done" || type === "crash";
+	return type === "call" || type === "output" || type === "observation" || type === "done" || type === "crash";
 }
 
 export function isHostToWorkerMessage(value: unknown): value is HostToWorkerMessage {

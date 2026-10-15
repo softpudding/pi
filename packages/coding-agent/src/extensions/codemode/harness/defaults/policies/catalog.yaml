@@ -1,0 +1,4 @@
+select: all
+detail: summary
+groupBy: module
+budgetTokens: 3000

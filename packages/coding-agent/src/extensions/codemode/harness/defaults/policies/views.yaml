@@ -1,0 +1,8 @@
+harness.overview: rules/views.mjs#overview
+harness.detail: rules/views.mjs#detail
+harness.prepare: rules/views.mjs#prepare
+harness.edit: rules/views.mjs#edit
+harness.status: rules/views.mjs#status
+harness.diagnostics: rules/views.mjs#diagnostics
+pi.read: rules/views.mjs#read
+debug.dump: rules/views.mjs#dump
