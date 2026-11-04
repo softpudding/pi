@@ -54,6 +54,7 @@ describe("session byte index", () => {
 		expect(index.readEntry("missing")).toBeUndefined();
 		expect(index.latestCompaction()).toEqual(f.session.getEntry(checkpoint));
 		const latest = index.readPage({ limit: 2 });
+		expect(index.readCheckpointPage(2)).toEqual(latest);
 		expect(latest.entries.map((row) => row.entry)).toEqual(f.entries().slice(-2));
 		expect(latest.hasEarlier).toBe(true);
 		expect(latest.hasLater).toBe(false);
@@ -129,6 +130,7 @@ describe("session byte index", () => {
 		const index = f.open();
 		index.sync();
 		expect(index.latestCompaction()).toBeUndefined();
+		expect(index.readCheckpointPage().entries.map((row) => row.entry)).toEqual(f.entries());
 		expect(index.latestCompaction(other)).toBeUndefined();
 		expect(index.latestCompaction(first)).toEqual(f.session.getEntry(first));
 		expect(index.latestCompaction(abandoned)).toEqual(f.session.getEntry(abandoned));
@@ -299,6 +301,7 @@ describe("indexed checkpoint recovery", () => {
 			leafId: null,
 			settings: { model: null, thinkingLevel: "off" },
 		});
+		expect(index.readCheckpointPage().entries.map((row) => row.entry)).toEqual([f.session.getHeader()]);
 		const common = f.user("初始问题");
 		f.write();
 		index.sync(true);

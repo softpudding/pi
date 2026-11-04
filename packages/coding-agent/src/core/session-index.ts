@@ -364,6 +364,11 @@ export class SessionIndex {
 			) as unknown as Location[];
 	}
 
+	/** First browser page starts at the active branch's latest checkpoint. */
+	readCheckpointPage(limit = 100): SessionHistoryPage {
+		return this.readPage({ after: this.leafLocation()?.checkpoint ?? 0, limit });
+	}
+
 	/** Pages are chronological; without a cursor, return the newest page. */
 	readPage({
 		before,
