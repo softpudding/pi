@@ -38,6 +38,7 @@ import {
 	createCompactionSummaryMessage,
 	createCustomMessage,
 } from "./messages.ts";
+import { type CustomMessageMatch, SessionIndex } from "./session-index.ts";
 export const CURRENT_SESSION_VERSION = 3;
 
 export interface SessionHeader {
@@ -253,6 +254,10 @@ export type ReadonlySessionManager = Pick<
 	| "getEntry"
 	| "getLabel"
 	| "getBranch"
+	| "getRuntimeBranch"
+	| "getSettingsEntries"
+	| "getCustomEntries"
+	| "findCustomMessage"
 	| "buildContextEntries"
 	| "buildSessionProjection"
 	| "getHeader"
@@ -996,6 +1001,10 @@ export class SessionManager {
 	private labelsById: Map<string, string> = new Map();
 	private labelTimestampsById: Map<string, string> = new Map();
 	private leafId: string | null = null;
+	private indexed: boolean;
+	private sessionIndex: SessionIndex | undefined;
+	private settingsEntries: SessionEntry[] = [];
+	private historicalLabelsLoaded = false;
 
 	private constructor(
 		cwd: string,
@@ -1004,7 +1013,9 @@ export class SessionManager {
 		persist: boolean,
 		newSessionOptions?: NewSessionOptions,
 		preloadedFileEntries?: FileEntry[],
+		indexed = false,
 	) {
+		this.indexed = indexed;
 		this.cwd = resolvePath(cwd);
 		this.sessionDir = normalizePath(sessionDir);
 		this.persist = persist;
@@ -1027,8 +1038,38 @@ export class SessionManager {
 	}
 
 	private _setSessionFile(sessionFile: string, preloadedFileEntries?: FileEntry[]): void {
+		this.close();
+		this.byId.clear();
+		this.settingsEntries = [];
 		this.sessionFile = resolvePath(sessionFile);
 		if (existsSync(this.sessionFile)) {
+			let indexedHeader: SessionHeader | null = null;
+			if (this.indexed) {
+				try {
+					indexedHeader = readSessionHeader(this.sessionFile);
+				} catch (error) {
+					if (!(error instanceof SessionHeaderScanLimitError)) throw error;
+					preloadedFileEntries ??= loadEntriesFromFile(this.sessionFile);
+				}
+			}
+			if (indexedHeader?.version === CURRENT_SESSION_VERSION) {
+				this.sessionIndex = new SessionIndex(this.sessionFile);
+				try {
+					const { indexedBytes } = this.sessionIndex.sync();
+					// Same single-writer repair as loadEntriesFromFile: terminate the final
+					// line before appending, without scanning the already indexed history.
+					if (statSync(this.sessionFile).size > indexedBytes) {
+						appendFileSync(this.sessionFile, "\n");
+						this.sessionIndex.sync();
+					}
+					this._restoreIndexedBranch();
+					this.flushed = true;
+					return;
+				} catch (error) {
+					this.close();
+					throw error;
+				}
+			}
 			const entries = preloadedFileEntries ?? loadEntriesFromFile(this.sessionFile);
 
 			// If file was empty, initialize it with a valid session header. If it was
@@ -1047,6 +1088,11 @@ export class SessionManager {
 
 			this._loadEntries(entries);
 			this.flushed = true;
+			if (this.indexed) {
+				this.sessionIndex = new SessionIndex(this.sessionFile);
+				this.sessionIndex.sync(true);
+				this._restoreIndexedBranch();
+			}
 		} else {
 			const explicitPath = this.sessionFile;
 			this.newSession();
@@ -1058,6 +1104,8 @@ export class SessionManager {
 		if (options?.id !== undefined) {
 			assertValidSessionId(options.id);
 		}
+		this.close();
+		this.settingsEntries = [];
 		this.sessionId = options?.id ?? createSessionId();
 		const timestamp = new Date().toISOString();
 		const header: SessionHeader = {
@@ -1104,6 +1152,7 @@ export class SessionManager {
 		this.byId.clear();
 		this.labelsById.clear();
 		this.labelTimestampsById.clear();
+		this.historicalLabelsLoaded = false;
 		this.leafId = null;
 		for (const entry of this.fileEntries) {
 			if (entry.type === "session") continue;
@@ -1119,6 +1168,43 @@ export class SessionManager {
 				}
 			}
 		}
+	}
+
+	private _restoreIndexedBranch(leafId?: string | null): void {
+		if (!this.sessionIndex) return;
+		const recovery = this.sessionIndex.readRecovery(leafId);
+		// Preserve identities for still-live messages used by retry/context-edit tracking.
+		this.fileEntries = [recovery.header, ...recovery.entries.map((entry) => this.byId.get(entry.id) ?? entry)];
+		this.sessionId = recovery.header.id;
+		this.settingsEntries = recovery.settingsEntries;
+		this._buildIndex();
+	}
+
+	private _loadHistoricalLabels(): void {
+		if (!this.sessionIndex || this.historicalLabelsLoaded) return;
+		this.labelsById.clear();
+		this.labelTimestampsById.clear();
+		for (const entry of this.sessionIndex.readEntries("label")) {
+			if (entry.type !== "label") continue;
+			if (entry.label) {
+				this.labelsById.set(entry.targetId, entry.label);
+				this.labelTimestampsById.set(entry.targetId, entry.timestamp);
+			} else {
+				this.labelsById.delete(entry.targetId);
+				this.labelTimestampsById.delete(entry.targetId);
+			}
+		}
+		this.historicalLabelsLoaded = true;
+	}
+
+	/** Release the index connection after the owning runtime stops using this manager. */
+	close(): void {
+		this.sessionIndex?.close();
+		this.sessionIndex = undefined;
+	}
+
+	private _hasEntry(id: string): boolean {
+		return this.byId.has(id) || (this.sessionIndex?.hasEntry(id) ?? false);
 	}
 
 	private _rewriteFile(): void {
@@ -1186,6 +1272,12 @@ export class SessionManager {
 		} else {
 			appendFileSync(this.sessionFile, `${JSON.stringify(entry)}\n`);
 		}
+		if (this.indexed) {
+			const newlyIndexed = !this.sessionIndex;
+			this.sessionIndex ??= new SessionIndex(this.sessionFile);
+			this.sessionIndex.sync();
+			if (newlyIndexed) this._restoreIndexedBranch(this.leafId);
+		}
 	}
 
 	private _appendEntry(entry: SessionEntry): void {
@@ -1193,6 +1285,15 @@ export class SessionManager {
 		this.byId.set(entry.id, entry);
 		this.leafId = entry.id;
 		this._persist(entry);
+		if (this.indexed) {
+			const isSetting =
+				entry.type === "model_change" ||
+				entry.type === "thinking_level_change" ||
+				(entry.type === "message" && entry.message.role === "assistant");
+			if (isSetting)
+				this.settingsEntries = [...this.settingsEntries.filter((old) => old.type !== entry.type), entry];
+			if (entry.type === "compaction") this._restoreIndexedBranch(entry.id);
+		}
 	}
 
 	/** Append a message as child of current leaf, then advance leaf. Returns entry id.
@@ -1204,7 +1305,7 @@ export class SessionManager {
 	appendMessage(message: Message | CustomMessage | BashExecutionMessage): string {
 		const entry: SessionMessageEntry = {
 			type: "message",
-			id: generateId(this.byId),
+			id: generateId({ has: (id) => this._hasEntry(id) }),
 			parentId: this.leafId,
 			timestamp: new Date().toISOString(),
 			message,
@@ -1217,7 +1318,7 @@ export class SessionManager {
 	appendThinkingLevelChange(thinkingLevel: string): string {
 		const entry: ThinkingLevelChangeEntry = {
 			type: "thinking_level_change",
-			id: generateId(this.byId),
+			id: generateId({ has: (id) => this._hasEntry(id) }),
 			parentId: this.leafId,
 			timestamp: new Date().toISOString(),
 			thinkingLevel,
@@ -1230,7 +1331,7 @@ export class SessionManager {
 	appendModelChange(provider: string, modelId: string): string {
 		const entry: ModelChangeEntry = {
 			type: "model_change",
-			id: generateId(this.byId),
+			id: generateId({ has: (id) => this._hasEntry(id) }),
 			parentId: this.leafId,
 			timestamp: new Date().toISOString(),
 			provider,
@@ -1244,7 +1345,7 @@ export class SessionManager {
 	appendUsage(kind: string, provider: string, model: string, usage: Usage, note?: string): UsageEntry {
 		const entry: UsageEntry = {
 			type: "usage",
-			id: generateId(this.byId),
+			id: generateId({ has: (id) => this._hasEntry(id) }),
 			parentId: this.leafId,
 			timestamp: new Date().toISOString(),
 			kind,
@@ -1268,7 +1369,7 @@ export class SessionManager {
 	): string {
 		const timestamp = new Date().toISOString();
 		const systemMessage = getCurrentSystemMessage(this.buildSessionProjection().messages);
-		const id = generateId(this.byId);
+		const id = generateId({ has: (id) => this._hasEntry(id) });
 		const entry: CompactionEntry<T> = {
 			type: "compaction",
 			id,
@@ -1292,7 +1393,7 @@ export class SessionManager {
 			type: "custom",
 			customType,
 			data,
-			id: generateId(this.byId),
+			id: generateId({ has: (id) => this._hasEntry(id) }),
 			parentId: this.leafId,
 			timestamp: new Date().toISOString(),
 		};
@@ -1305,7 +1406,7 @@ export class SessionManager {
 		const sanitizedName = name.replace(/[\r\n]+/g, " ").trim();
 		const entry: SessionInfoEntry = {
 			type: "session_info",
-			id: generateId(this.byId),
+			id: generateId({ has: (id) => this._hasEntry(id) }),
 			parentId: this.leafId,
 			timestamp: new Date().toISOString(),
 			name: sanitizedName,
@@ -1316,6 +1417,10 @@ export class SessionManager {
 
 	/** Get the current session name from the latest session_info entry, if any. */
 	getSessionName(): string | undefined {
+		if (this.sessionIndex) {
+			const entry = this.sessionIndex.latestEntry("session_info");
+			return entry?.type === "session_info" ? entry.name?.trim() || undefined : undefined;
+		}
 		// Walk entries in reverse to find the latest session_info entry.
 		// Empty names explicitly clear the session title. Reads fileEntries directly: the footer
 		// calls this on every frame, and getEntries() copies the whole session.
@@ -1348,7 +1453,7 @@ export class SessionManager {
 			content,
 			display,
 			details,
-			id: generateId(this.byId),
+			id: generateId({ has: (id) => this._hasEntry(id) }),
 			parentId: this.leafId,
 			timestamp: new Date().toISOString(),
 		};
@@ -1366,9 +1471,12 @@ export class SessionManager {
 		) {
 			throw new Error("Context edit replacement must be null or contain string/array content");
 		}
-		const target = this.byId.get(targetId);
+		const target = this.getEntry(targetId);
 		if (!target) throw new Error(`Entry ${targetId} not found`);
-		if (!this.getBranch().some((entry) => entry.id === targetId)) {
+		if (
+			!this.getRuntimeBranch().some((entry) => entry.id === targetId) &&
+			!this.getBranch().some((entry) => entry.id === targetId)
+		) {
 			throw new Error(`Entry ${targetId} is not on the active branch`);
 		}
 		const editable =
@@ -1387,7 +1495,7 @@ export class SessionManager {
 				: replacement;
 		const entry: ContextEditEntry = {
 			type: "context_edit",
-			id: generateId(this.byId),
+			id: generateId({ has: (id) => this._hasEntry(id) }),
 			parentId: this.leafId,
 			timestamp: new Date().toISOString(),
 			targetId,
@@ -1410,7 +1518,8 @@ export class SessionManager {
 	}
 
 	getEntry(id: string): SessionEntry | undefined {
-		return this.byId.get(id);
+		const entry = this.byId.get(id) ?? this.sessionIndex?.readEntry(id);
+		return entry?.type === "session" ? undefined : entry;
 	}
 
 	/**
@@ -1418,7 +1527,7 @@ export class SessionManager {
 	 */
 	getChildren(parentId: string): SessionEntry[] {
 		const children: SessionEntry[] = [];
-		for (const entry of this.byId.values()) {
+		for (const entry of this.getEntries()) {
 			if (entry.parentId === parentId) {
 				children.push(entry);
 			}
@@ -1430,6 +1539,7 @@ export class SessionManager {
 	 * Get the label for an entry, if any.
 	 */
 	getLabel(id: string): string | undefined {
+		this._loadHistoricalLabels();
 		return this.labelsById.get(id);
 	}
 
@@ -1439,12 +1549,12 @@ export class SessionManager {
 	 * Pass undefined or empty string to clear the label.
 	 */
 	appendLabelChange(targetId: string, label: string | undefined): string {
-		if (!this.byId.has(targetId)) {
+		if (!this._hasEntry(targetId)) {
 			throw new Error(`Entry ${targetId} not found`);
 		}
 		const entry: LabelEntry = {
 			type: "label",
-			id: generateId(this.byId),
+			id: generateId({ has: (id) => this._hasEntry(id) }),
 			parentId: this.leafId,
 			timestamp: new Date().toISOString(),
 			targetId,
@@ -1467,6 +1577,14 @@ export class SessionManager {
 	 * Use buildSessionContext() to get the resolved messages for the LLM.
 	 */
 	getBranch(fromId?: string): SessionEntry[] {
+		if (this.sessionIndex) {
+			return this.sessionIndex.readBranch(fromId ?? this.leafId).map((entry) => this.byId.get(entry.id) ?? entry);
+		}
+		return this.getRuntimeBranch(fromId);
+	}
+
+	/** Loaded branch suffix sufficient for context, retry, and compaction. Not full history. */
+	getRuntimeBranch(fromId?: string): SessionEntry[] {
 		const path: SessionEntry[] = [];
 		const startId = fromId ?? this.leafId;
 		let current = startId ? this.byId.get(startId) : undefined;
@@ -1478,12 +1596,39 @@ export class SessionManager {
 		return path;
 	}
 
+	/** Model/thinking metadata may predate the context checkpoint. */
+	getSettingsEntries(): SessionEntry[] {
+		return this.sessionIndex ? [...this.settingsEntries] : this.getRuntimeBranch();
+	}
+
+	getCustomEntries(customType: string): CustomEntry[] {
+		return this.sessionIndex
+			? this.sessionIndex.readCustomEntries(customType, this.leafId)
+			: this.getBranch().filter(
+					(entry): entry is CustomEntry => entry.type === "custom" && entry.customType === customType,
+				);
+	}
+
+	/** Lookup across persisted history, including messages summarized by compaction. */
+	findCustomMessage(customType: string, match?: CustomMessageMatch): CustomMessageEntry | undefined {
+		if (this.sessionIndex) return this.sessionIndex.findCustomMessage(customType, match);
+		return this.getEntries().findLast((entry): entry is CustomMessageEntry => {
+			if (entry.type !== "custom_message" || entry.customType !== customType) return false;
+			if (!match) return true;
+			const details = entry.details as Record<string, unknown> | undefined;
+			const value = details?.[match.key];
+			return match.value === undefined
+				? ["string", "number", "boolean"].includes(typeof value)
+				: value === match.value;
+		});
+	}
+
 	/**
 	 * Build the active, compaction-aware entry list for context/rendering.
 	 * Uses tree traversal from current leaf.
 	 */
 	buildContextEntries(): SessionEntry[] {
-		return buildContextEntries(this.getEntries(), this.leafId, this.byId);
+		return buildContextEntries(this.getRuntimeBranch(), this.leafId, this.byId);
 	}
 
 	/**
@@ -1491,7 +1636,8 @@ export class SessionManager {
 	 * Uses tree traversal from current leaf.
 	 */
 	buildSessionProjection(): SessionProjection {
-		return buildSessionProjection(this.getEntries(), this.leafId, this.byId);
+		const projection = buildSessionProjection(this.getRuntimeBranch(), this.leafId, this.byId);
+		return this.sessionIndex ? { ...projection, ...getSessionContextSettings(this.settingsEntries) } : projection;
 	}
 
 	buildSessionContext(): SessionContext {
@@ -1509,7 +1655,7 @@ export class SessionManager {
 
 	/** Number of session entries (excludes header), without copying them like `getEntries()`. */
 	getEntryCount(): number {
-		return this.byId.size;
+		return this.sessionIndex?.entryCount() ?? this.byId.size;
 	}
 
 	/**
@@ -1518,6 +1664,7 @@ export class SessionManager {
 	 * change the leaf pointer. Entries cannot be modified or deleted.
 	 */
 	getEntries(): SessionEntry[] {
+		if (this.sessionIndex) return this.sessionIndex.readEntries().map((entry) => this.byId.get(entry.id) ?? entry);
 		return this.fileEntries.filter((e): e is SessionEntry => e.type !== "session");
 	}
 
@@ -1527,6 +1674,7 @@ export class SessionManager {
 	 * Orphaned entries (broken parent chain) are also returned as roots.
 	 */
 	getTree(): SessionTreeNode[] {
+		this._loadHistoricalLabels();
 		const entries = this.getEntries();
 		const nodeMap = new Map<string, SessionTreeNode>();
 		const roots: SessionTreeNode[] = [];
@@ -1577,10 +1725,11 @@ export class SessionManager {
 	 * are not modified or deleted.
 	 */
 	branch(branchFromId: string): void {
-		if (!this.byId.has(branchFromId)) {
+		if (!this._hasEntry(branchFromId)) {
 			throw new Error(`Entry ${branchFromId} not found`);
 		}
 		this.leafId = branchFromId;
+		this._restoreIndexedBranch(branchFromId);
 	}
 
 	/**
@@ -1590,6 +1739,7 @@ export class SessionManager {
 	 */
 	resetLeaf(): void {
 		this.leafId = null;
+		this._restoreIndexedBranch(null);
 	}
 
 	/**
@@ -1604,14 +1754,15 @@ export class SessionManager {
 		fromHook?: boolean,
 		usage?: Usage,
 	): string {
-		if (branchFromId !== null && !this.byId.has(branchFromId)) {
+		if (branchFromId !== null && !this._hasEntry(branchFromId)) {
 			throw new Error(`Entry ${branchFromId} not found`);
 		}
 		const fromId = this.leafId ?? "root";
 		this.leafId = branchFromId;
+		this._restoreIndexedBranch(branchFromId);
 		const entry: BranchSummaryEntry = {
 			type: "branch_summary",
-			id: generateId(this.byId),
+			id: generateId({ has: (id) => this._hasEntry(id) }),
 			parentId: branchFromId,
 			timestamp: new Date().toISOString(),
 			fromId,
@@ -1630,11 +1781,13 @@ export class SessionManager {
 	 * Returns the new session file path, or undefined if not persisting.
 	 */
 	createBranchedSession(leafId: string): string | undefined {
+		this._loadHistoricalLabels();
 		const previousSessionFile = this.sessionFile;
 		const path = this.getBranch(leafId);
 		if (path.length === 0) {
 			throw new Error(`Entry ${leafId} not found`);
 		}
+		this.close();
 
 		// Filter out LabelEntry from path - we'll recreate them from the resolved map.
 		// Because labels are real tree entries, later entries can be children of labels;
@@ -1719,6 +1872,11 @@ export class SessionManager {
 			if (this._hasConversation()) {
 				this._rewriteFile();
 				this.flushed = true;
+				if (this.indexed) {
+					this.sessionIndex = new SessionIndex(newSessionFile);
+					this.sessionIndex.sync();
+					this._restoreIndexedBranch();
+				}
 			} else {
 				this.flushed = false;
 			}
@@ -1762,8 +1920,15 @@ export class SessionManager {
 	 * @param path Path to session file
 	 * @param sessionDir Optional session directory for /new or /branch. If omitted, derives from file's parent.
 	 * @param cwdOverride Optional cwd override instead of the session header cwd.
+	 * @param options.indexed Keep only the checkpoint suffix in memory; history getters read JSONL on demand.
+	 * The caller owns close(). JSONL is authoritative; the adjacent SQLite index is rebuildable.
 	 */
-	static open(path: string, sessionDir?: string, cwdOverride?: string): SessionManager {
+	static open(
+		path: string,
+		sessionDir?: string,
+		cwdOverride?: string,
+		options?: { indexed?: boolean },
+	): SessionManager {
 		const resolvedPath = resolvePath(path);
 		let header: SessionHeader | null = null;
 		let preloadedFileEntries: FileEntry[] | undefined;
@@ -1782,7 +1947,7 @@ export class SessionManager {
 		const cwd = cwdOverride ?? (header ? getSessionHeaderCwd(header) : undefined) ?? process.cwd();
 		// If no sessionDir provided, derive from file's parent directory
 		const dir = sessionDir ? normalizePath(sessionDir) : resolve(resolvedPath, "..");
-		return new SessionManager(cwd, dir, resolvedPath, true, undefined, preloadedFileEntries);
+		return new SessionManager(cwd, dir, resolvedPath, true, undefined, preloadedFileEntries, options?.indexed);
 	}
 
 	/**

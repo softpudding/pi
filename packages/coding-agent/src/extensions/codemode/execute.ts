@@ -600,7 +600,7 @@ export async function executeCodemode(
 				return releaseCodemodeWorker;
 			},
 		});
-		const store = ctx ? readCodemodeStore(ctx.sessionManager.getBranch()) : {};
+		const store = ctx ? readCodemodeStore(ctx.sessionManager.getCustomEntries(CODEMODE_STORE_ENTRY_TYPE)) : {};
 		result = await sandbox.execute(code, { signal, store });
 	} finally {
 		await sandbox?.close();

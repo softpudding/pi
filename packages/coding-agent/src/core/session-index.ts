@@ -1,9 +1,11 @@
+import { createHash } from "node:crypto";
 import { closeSync, fstatSync, openSync, readSync } from "node:fs";
 import { resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import type {
 	CompactionEntry,
 	CustomEntry,
+	CustomMessageEntry,
 	FileEntry,
 	SessionContext,
 	SessionEntry,
@@ -55,6 +57,16 @@ export interface SessionRecovery {
 	bytesRead: number;
 }
 
+export interface CustomMessageMatch {
+	key: string;
+	/** Omit to find the latest message with this scalar detail present. */
+	value?: string | number | boolean;
+}
+
+function detailHash(value: string | number | boolean): string {
+	return createHash("sha256").update(JSON.stringify(value)).digest("hex");
+}
+
 /**
  * Rebuildable byte index for an append-only pi JSONL file. It never writes the log.
  * Call sync() before reading to include new complete lines; an incomplete tail is
@@ -74,7 +86,10 @@ export class SessionIndex {
 			const version = this.db.prepare("PRAGMA user_version").get() as { user_version: number };
 			// Only derived offsets live here. A changed index schema is rebuilt from
 			// JSONL by the next sync, without migrating or rewriting session history.
-			if (version.user_version !== 1) this.db.exec("DROP TABLE IF EXISTS entries; DROP TABLE IF EXISTS state;");
+			if (version.user_version !== 2)
+				this.db.exec(
+					"DROP TABLE IF EXISTS entries; DROP TABLE IF EXISTS state; DROP TABLE IF EXISTS message_details;",
+				);
 			this.db.exec(`
 				CREATE TABLE IF NOT EXISTS state (
 					id INTEGER PRIMARY KEY CHECK (id = 1), source TEXT NOT NULL,
@@ -87,7 +102,13 @@ export class SessionIndex {
 					thinking_offset INTEGER, custom_type TEXT
 				);
 				CREATE INDEX IF NOT EXISTS entries_id ON entries(id, offset);
-				PRAGMA user_version = 1;
+				CREATE INDEX IF NOT EXISTS entries_custom ON entries(kind, custom_type, offset);
+				CREATE TABLE IF NOT EXISTS message_details (
+					offset INTEGER NOT NULL, custom_type TEXT NOT NULL, key TEXT NOT NULL, value_hash TEXT NOT NULL,
+					PRIMARY KEY (offset, key)
+				);
+				CREATE INDEX IF NOT EXISTS detail_lookup ON message_details(custom_type, key, value_hash, offset);
+				PRAGMA user_version = 2;
 				COMMIT;
 			`);
 		} catch (error) {
@@ -112,7 +133,7 @@ export class SessionIndex {
 				this.db.exec("COMMIT");
 				return { bytesRead: 0, indexedBytes: previous.indexed_bytes };
 			}
-			if (reset) this.db.exec("DELETE FROM entries; DELETE FROM state;");
+			if (reset) this.db.exec("DELETE FROM entries; DELETE FROM state; DELETE FROM message_details;");
 			let offset = reset ? 0 : previous.indexed_bytes;
 			let position = offset;
 			let pending = Buffer.alloc(0);
@@ -120,6 +141,7 @@ export class SessionIndex {
 			const buffer = Buffer.allocUnsafe(1024 * 1024);
 			const insert = this.db.prepare("INSERT INTO entries VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
 			const parent = this.db.prepare("SELECT * FROM entries WHERE id = ? ORDER BY offset DESC LIMIT 1");
+			const detail = this.db.prepare("INSERT INTO message_details VALUES (?, ?, ?, ?)");
 			while (position < stat.size) {
 				const count = readSync(fd, buffer, 0, Math.min(buffer.length, stat.size - position), position);
 				if (!count) throw new Error("Session file was truncated during indexing");
@@ -157,6 +179,14 @@ export class SessionIndex {
 							entry.type === "thinking_level_change" ? offset : (ancestor?.thinking_offset ?? null),
 							entry.type === "custom" || entry.type === "custom_message" ? entry.customType : null,
 						);
+						if (entry.type === "custom_message" && entry.details && typeof entry.details === "object") {
+							for (const [key, value] of Object.entries(entry.details)) {
+								if (typeof value === "string" || typeof value === "number" || typeof value === "boolean") {
+									// Hash scalar metadata so long text fields aren't duplicated in the index.
+									detail.run(offset, entry.customType, key, detailHash(value));
+								}
+							}
+						}
 					}
 					offset += length;
 					start = newline + 1;
@@ -182,6 +212,53 @@ export class SessionIndex {
 			| Location
 			| undefined;
 		return row ? this.readRows([row])[0].entry : undefined;
+	}
+
+	hasEntry(id: string): boolean {
+		return !!this.db.prepare("SELECT 1 FROM entries WHERE id = ? AND kind != 'session' LIMIT 1").get(id);
+	}
+
+	entryCount(): number {
+		return (
+			this.db.prepare("SELECT count(*) AS count FROM entries WHERE kind != 'session'").get() as { count: number }
+		).count;
+	}
+
+	/** Physical history, including abandoned branches; read only when explicitly requested. */
+	readEntries(kind?: SessionEntry["type"]): SessionEntry[] {
+		const rows = (kind === undefined
+			? this.db.prepare("SELECT * FROM entries WHERE kind != 'session' ORDER BY offset").all()
+			: this.db.prepare("SELECT * FROM entries WHERE kind = ? ORDER BY offset").all(kind)) as unknown as Location[];
+		return this.readRows(rows).map((row) => row.entry as SessionEntry);
+	}
+
+	latestEntry(kind: SessionEntry["type"]): SessionEntry | undefined {
+		const row = this.db.prepare("SELECT * FROM entries WHERE kind = ? ORDER BY offset DESC LIMIT 1").get(kind) as
+			| Location
+			| undefined;
+		return row ? (this.readRows([row])[0].entry as SessionEntry) : undefined;
+	}
+
+	/** Search physical history by extension identity, independent of compaction/branching. */
+	findCustomMessage(customType: string, match?: CustomMessageMatch): CustomMessageEntry | undefined {
+		const row = (
+			match
+				? this.db
+						.prepare(`SELECT e.* FROM message_details d JOIN entries e ON e.offset = d.offset
+				WHERE d.custom_type = ? AND d.key = ? ${match.value === undefined ? "" : "AND d.value_hash = ?"}
+				ORDER BY d.offset DESC LIMIT 1`)
+						.get(
+							...(match.value === undefined
+								? [customType, match.key]
+								: [customType, match.key, detailHash(match.value)]),
+						)
+				: this.db
+						.prepare(
+							"SELECT * FROM entries WHERE kind = 'custom_message' AND custom_type = ? ORDER BY offset DESC LIMIT 1",
+						)
+						.get(customType)
+		) as Location | undefined;
+		return row ? (this.readRows([row])[0].entry as CustomMessageEntry) : undefined;
 	}
 
 	/** Latest checkpoint on the selected leaf's branch, not an abandoned branch. */
