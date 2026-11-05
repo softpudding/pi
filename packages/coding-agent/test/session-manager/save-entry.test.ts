@@ -1,7 +1,31 @@
+import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { type CustomEntry, SessionManager } from "../../src/core/session-manager.ts";
 
 describe("SessionManager.saveCustomEntry", () => {
+	it.each([false, true])("persists visible custom input before a reply (indexed=%s)", (indexed) => {
+		const directory = mkdtempSync(join(tmpdir(), "pi-custom-input-"));
+		const file = join(directory, "session.jsonl");
+		const session = SessionManager.open(file, undefined, directory, { indexed });
+		try {
+			session.appendCustomMessageEntry("profile", "Setup instructions", false);
+			expect(existsSync(file)).toBe(false);
+			const id = session.appendCustomMessageEntry("inbox", "First input", true, { message_id: "first" });
+			expect(existsSync(file)).toBe(true);
+			const restored = SessionManager.open(file, undefined, directory, { indexed });
+			try {
+				expect(restored.findCustomMessage("inbox", { key: "message_id", value: "first" })?.id).toBe(id);
+			} finally {
+				restored.close();
+			}
+		} finally {
+			session.close();
+			rmSync(directory, { recursive: true, force: true });
+		}
+	});
+
 	it("saves custom entries and includes them in tree traversal", () => {
 		const session = SessionManager.inMemory();
 

@@ -1244,14 +1244,17 @@ export class SessionManager {
 	}
 
 	/**
-	 * A new session file is created only once the session contains a user or assistant message.
+	 * A new session file is created once it contains a user, assistant, or visible custom message.
 	 * Setup entries alone (model, thinking level, system prompt) stay in memory so opening and
 	 * closing pi without chatting leaves no file behind. Starting at the user message (not the
 	 * first assistant reply) keeps the prompt on disk if the first turn never completes (#10000).
+	 * Visible custom messages can also start a conversation through an extension or SDK inbox.
 	 */
 	private _hasConversation(): boolean {
 		return this.fileEntries.some(
-			(e) => e.type === "message" && (e.message.role === "user" || e.message.role === "assistant"),
+			(e) =>
+				(e.type === "message" && (e.message.role === "user" || e.message.role === "assistant")) ||
+				(e.type === "custom_message" && e.display),
 		);
 	}
 

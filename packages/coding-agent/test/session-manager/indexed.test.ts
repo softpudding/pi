@@ -105,7 +105,7 @@ it("keeps branch navigation, archived labels, children, and forks available on d
 it("indexes buffered custom messages only after persistence and catches a complete unterminated tail", () => {
 	const f = fixture();
 	const manager = f.open();
-	const id = manager.appendCustomMessageEntry("inbox", "request", true, { message_id: "one", task_id: 4 });
+	const id = manager.appendCustomMessageEntry("inbox", "request", false, { message_id: "one", task_id: 4 });
 	expect(existsSync(f.file)).toBe(false);
 	expect(manager.findCustomMessage("inbox", { key: "message_id", value: "one" })?.id).toBe(id);
 	manager.appendMessage({ role: "user", content: "flush", timestamp: 1 });
