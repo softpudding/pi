@@ -404,6 +404,7 @@ export class AgentSession {
 	private _compactionAbortController: AbortController | undefined = undefined;
 	private _autoCompactionAbortController: AbortController | undefined = undefined;
 	private _overflowRecoveryAttempted = false;
+	private _autoCompactionError: Error | undefined;
 
 	// Branch summarization state
 	private _branchSummaryAbortController: AbortController | undefined = undefined;
@@ -1844,6 +1845,7 @@ export class AgentSession {
 	private async _startRun(trigger: BeforeAgentStartTrigger, onStarted?: () => void): Promise<void> {
 		this._isAgentRunActive = true;
 		this._agentRunAbortRequested = false;
+		this._autoCompactionError = undefined;
 		let messages: AgentMessage[];
 		try {
 			messages = await this._prepareRun(trigger);
@@ -1956,6 +1958,9 @@ export class AgentSession {
 			this._finishCancelledRetry();
 			return false;
 		}
+		// Agent-core can turn a pre-request exception into an assistant error. Do not
+		// retry that response or drain queued input after summarization already failed.
+		if (this._autoCompactionError) throw this._autoCompactionError;
 		if (!message) return this.agent.hasQueuedMessages();
 
 		if (this._isRetryableError(message) && (await this._prepareRetry(message))) {
@@ -3257,12 +3262,12 @@ export class AgentSession {
 		} catch (error) {
 			const message = error instanceof Error ? error.message : "compaction failed";
 			const aborted = abortController?.signal.aborted === true || cancelledByExtension;
+			const errorMessage = aborted
+				? undefined
+				: reason === "overflow"
+					? `Context overflow recovery failed: ${message}`
+					: `Auto-compaction failed: ${message}`;
 			if (started) {
-				const errorMessage = aborted
-					? undefined
-					: reason === "overflow"
-						? `Context overflow recovery failed: ${message}`
-						: `Auto-compaction failed: ${message}`;
 				this._emit({
 					type: "compaction_end",
 					reason,
@@ -3278,6 +3283,10 @@ export class AgentSession {
 					willRetry: false,
 					fromExtension,
 				});
+			}
+			if (!aborted) {
+				this._autoCompactionError = new Error(errorMessage, { cause: error });
+				throw this._autoCompactionError;
 			}
 			return false;
 		} finally {

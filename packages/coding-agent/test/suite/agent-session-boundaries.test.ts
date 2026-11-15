@@ -1045,7 +1045,9 @@ describe("durable length recovery", () => {
 			fauxAssistantMessage("must not retry"),
 		]);
 
-		await harness.session.prompt("x".repeat(5000));
+		await expect(harness.session.prompt("x".repeat(5000))).rejects.toThrow(
+			"Context overflow recovery failed: Turn prefix summarization failed: summary failed",
+		);
 
 		const entries = harness.sessionManager.getEntries();
 		expect(entries.some((entry) => entry.type === "context_edit")).toBe(true);

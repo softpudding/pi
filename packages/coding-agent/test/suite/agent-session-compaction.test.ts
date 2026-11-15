@@ -419,7 +419,9 @@ describe("AgentSession compaction characterization", () => {
 		};
 		const sessionInternals = harness.session as unknown as SessionWithCompactionInternals;
 
-		await expect(sessionInternals._runAutoCompaction("threshold", false)).resolves.toBe(false);
+		await expect(sessionInternals._runAutoCompaction("threshold", false)).rejects.toThrow(
+			"Auto-compaction failed: summary generator blew up",
+		);
 
 		expect(harness.eventsOfType("compaction_end").at(-1)).toMatchObject({
 			reason: "threshold",
@@ -437,6 +439,58 @@ describe("AgentSession compaction characterization", () => {
 				errorMessage: "Auto-compaction failed: summary generator blew up",
 			}),
 		]);
+	});
+
+	it.each(["pre-prompt", "next-response"])(
+		"stops after failed %s compaction without consuming queued work",
+		async (boundary) => {
+			const harness = await createHarness({
+				models: [{ id: "faux-1", contextWindow: 10_000, maxTokens: 100 }],
+				settings: {
+					compaction: { enabled: true, keepRecentTokens: 1, reserveTokens: 1000 },
+					retry: { enabled: true, maxRetries: 1, baseDelayMs: 1 },
+				},
+			});
+			harnesses.push(harness);
+			seedCompactableSession(harness);
+			if (boundary === "pre-prompt") {
+				harness.sessionManager.appendMessage(createAssistant(harness, { totalTokens: 9500 }));
+				harness.session.refreshContext();
+			}
+			harness.session.subscribe((event) => {
+				if (event.type === "compaction_start") void harness.session.followUp("still queued");
+			});
+			harness.setResponses(
+				Array.from({ length: 4 }, () => () => {
+					expect(harness.session.isCompacting).toBe(true);
+					return fauxAssistantMessage("", {
+						stopReason: "error",
+						errorMessage: `${boundary === "pre-prompt" ? 503 : 400} summary unavailable`,
+					});
+				}),
+			);
+
+			await expect(
+				harness.session.prompt(boundary === "pre-prompt" ? "continue" : "x".repeat(40_000)),
+			).rejects.toThrow(/Auto-compaction failed: .*summary unavailable/);
+			// Pre-prompt: one summary retries once. Next response: two split summaries fail without retries.
+			expect(harness.faux.state.callCount).toBe(2);
+			expect(harness.session.pendingMessageCount).toBe(1);
+			expect(harness.session.isIdle).toBe(true);
+			expect(harness.sessionManager.getEntries().some((entry) => entry.type === "compaction")).toBe(false);
+		},
+	);
+
+	it("cancels automatic compaction without reporting a failure", async () => {
+		const { harness, compactionStarted } = await createAbortableCompactionHarness();
+		harnesses.push(harness);
+		const internals = harness.session as unknown as SessionWithCompactionInternals;
+		const compacting = internals._runAutoCompaction("threshold", false);
+		await compactionStarted;
+		harness.session.abortCompaction();
+		await expect(compacting).resolves.toBe(false);
+		expect(harness.eventsOfType("compaction_end").at(-1)).toMatchObject({ aborted: true, errorMessage: undefined });
+		expect(harness.session.isIdle).toBe(true);
 	});
 
 	it("compacts and resumes after a length stop below the desired output limit", async () => {
