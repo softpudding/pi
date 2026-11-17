@@ -37,7 +37,6 @@ export {
 	compact,
 	DEFAULT_COMPACTION_SETTINGS,
 	estimateTokens,
-	type FileOperations,
 	findCutPoint,
 	findTurnStartIndex,
 	type GenerateBranchSummaryOptions,

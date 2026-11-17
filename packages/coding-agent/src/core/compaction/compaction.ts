@@ -34,58 +34,7 @@ import {
 	sessionEntryToContextMessages,
 } from "../session-manager.ts";
 import { combineUsage } from "../usage-totals.ts";
-import {
-	computeFileLists,
-	createFileOps,
-	extractFileOpsFromMessage,
-	type FileOperations,
-	formatFileOperations,
-	SUMMARIZATION_SYSTEM_PROMPT,
-	serializeConversation,
-} from "./utils.ts";
-
-// ============================================================================
-// File Operation Tracking
-// ============================================================================
-
-/** Details stored in CompactionEntry.details for file tracking */
-export interface CompactionDetails {
-	readFiles: string[];
-	modifiedFiles: string[];
-}
-
-/**
- * Extract file operations from messages and previous compaction entries.
- */
-function extractFileOperations(
-	messages: AgentMessage[],
-	entries: SessionEntry[],
-	prevCompactionIndex: number,
-): FileOperations {
-	const fileOps = createFileOps();
-
-	// Collect from previous compaction's details (if pi-generated)
-	if (prevCompactionIndex >= 0) {
-		const prevCompaction = entries[prevCompactionIndex] as CompactionEntry;
-		if (!prevCompaction.fromHook && prevCompaction.details) {
-			// fromHook field kept for session file compatibility
-			const details = prevCompaction.details as CompactionDetails;
-			if (Array.isArray(details.readFiles)) {
-				for (const f of details.readFiles) fileOps.read.add(f);
-			}
-			if (Array.isArray(details.modifiedFiles)) {
-				for (const f of details.modifiedFiles) fileOps.edited.add(f);
-			}
-		}
-	}
-
-	// Extract from tool calls in messages
-	for (const msg of messages) {
-		extractFileOpsFromMessage(msg, fileOps);
-	}
-
-	return fileOps;
-}
+import { SUMMARIZATION_SYSTEM_PROMPT, serializeConversation, stripLegacyFileInventory } from "./utils.ts";
 
 // ============================================================================
 // Message Extraction
@@ -535,27 +484,28 @@ Use this EXACT format:
 - [Any data, examples, or references needed to continue]
 - [Or "(none)" if not applicable]
 
-Keep each section concise. Preserve exact file paths, function names, and error messages.`;
+Keep each section concise. Retain information needed for future work: active user constraints, unresolved work, consequential decisions, and references needed to resume. Omit stale state, duplicate details, and completed history that no longer affects the work. Keep exact file paths, function names, and error messages when they are needed.`;
 
 const UPDATE_SUMMARIZATION_INSTRUCTIONS = `Update the existing structured summary with new information. RULES:
-- PRESERVE all existing information from the previous summary
-- ADD new progress, decisions, and context from the new messages
-- UPDATE the Progress section: move items from "In Progress" to "Done" when completed
-- UPDATE "Next Steps" based on what was accomplished
-- PRESERVE exact file paths, function names, and error messages
-- If something is no longer relevant, you may remove it
+- MERGE new information into the relevant existing sections
+- RETAIN active user constraints, unresolved work, consequential decisions, and references needed to resume
+- REPLACE superseded facts and plans with the supported current state; keep unresolved conflicts explicit
+- REMOVE duplicate details, stale state, and completed history that no longer affects future work
+- UPDATE progress and next steps to reflect what actually happened
+- Keep the source and scope of requirements distinct from the assistant's own conclusions
+- Preserve exact file paths, function names, and error messages when needed to continue
 
 Use this EXACT format:
 
 ## Goal
-[Preserve existing goals, add new ones if the task expanded]
+[Current goals and any still-relevant longer-term goals]
 
 ## Constraints & Preferences
-- [Preserve existing, add new ones discovered]
+- [Still-applicable user requirements and their scope]
 
 ## Progress
 ### Done
-- [x] [Include previously done items AND newly completed items]
+- [x] [Completed work whose outcome still matters]
 
 ### In Progress
 - [ ] [Current work - update based on progress]
@@ -564,15 +514,15 @@ Use this EXACT format:
 - [Current blockers - remove if resolved]
 
 ## Key Decisions
-- **[Decision]**: [Brief rationale] (preserve all previous, add new)
+- **[Current decision]**: [Brief rationale and source]
 
 ## Next Steps
 1. [Update based on current state]
 
 ## Critical Context
-- [Preserve important context, add new if needed]
+- [Evidence and references needed to resume; unresolved conflicts if any]
 
-Keep each section concise. Preserve exact file paths, function names, and error messages.`;
+Keep each section concise. Preserve exact file paths, function names, and error messages when needed to continue.`;
 
 const UPDATE_SUMMARIZATION_PROMPT = `The messages above are NEW conversation messages to incorporate into the existing summary provided in <previous-summary> tags.
 
@@ -710,6 +660,7 @@ export async function generateSummaryWithUsage(
 	callbacks?: RetryCallbacks,
 	sessionId?: string,
 ): Promise<{ text: string; usage: Usage }> {
+	previousSummary = previousSummary === undefined ? undefined : stripLegacyFileInventory(previousSummary);
 	// Use update prompt if we have a previous summary, otherwise initial prompt
 	let basePrompt = previousSummary ? UPDATE_SUMMARIZATION_PROMPT : SUMMARIZATION_PROMPT;
 	if (customInstructions) {
@@ -768,8 +719,6 @@ export interface CompactionPreparation {
 	tokensBefore: number;
 	/** Summary from previous compaction, for iterative update */
 	previousSummary?: string;
-	/** File operations extracted from messagesToSummarize */
-	fileOps: FileOperations;
 	/** Compaction settions from settings.jsonl	*/
 	settings: CompactionSettings;
 }
@@ -866,7 +815,6 @@ export function prepareCompaction(
 
 	const projection = buildSessionProjection(pathEntries);
 	const projectedEntries = projection.entries;
-	const sourceEntries = projectedEntries.map((entry) => entry.sourceEntry);
 	// The newest compaction is projected first. Older compaction entries can still
 	// occur in its retained raw range, but their projected contribution is empty.
 	const prevCompactionIndex = projectedEntries.findIndex(
@@ -876,7 +824,9 @@ export function prepareCompaction(
 	let previousSummary: string | undefined;
 	let boundaryStart = 0;
 	if (prevCompactionIndex >= 0) {
-		previousSummary = (projectedEntries[prevCompactionIndex].sourceEntry as CompactionEntry).summary;
+		previousSummary = stripLegacyFileInventory(
+			(projectedEntries[prevCompactionIndex].sourceEntry as CompactionEntry).summary,
+		);
 		// The canonical projection has already selected the previous compaction's retained tail.
 		boundaryStart = prevCompactionIndex + 1;
 	}
@@ -900,16 +850,6 @@ export function prepareCompaction(
 
 	if (messagesToSummarize.length === 0 && turnPrefixMessages.length === 0) return undefined;
 
-	// Extract file operations from edited model-visible messages and the previous compaction.
-	const fileOps = extractFileOperations(messagesToSummarize, sourceEntries, prevCompactionIndex);
-
-	// Also extract file ops from turn prefix if splitting
-	if (cutPoint.isSplitTurn) {
-		for (const msg of turnPrefixMessages) {
-			extractFileOpsFromMessage(msg, fileOps);
-		}
-	}
-
 	return {
 		firstKeptEntryId,
 		messagesToSummarize,
@@ -917,7 +857,6 @@ export function prepareCompaction(
 		isSplitTurn: cutPoint.isSplitTurn,
 		tokensBefore,
 		previousSummary,
-		fileOps,
 		settings,
 	};
 }
@@ -963,22 +902,15 @@ export async function compact(
 	callbacks?: RetryCallbacks,
 	sessionId?: string,
 ): Promise<CompactionResult> {
-	const {
-		firstKeptEntryId,
-		messagesToSummarize,
-		turnPrefixMessages,
-		isSplitTurn,
-		tokensBefore,
-		previousSummary,
-		fileOps,
-	} = preparation;
+	const { firstKeptEntryId, messagesToSummarize, turnPrefixMessages, isSplitTurn, tokensBefore, previousSummary } =
+		preparation;
 
 	// Generate summaries and merge into one
 	let summary: string;
 	let summaryUsage: Usage;
 
 	if (isSplitTurn && turnPrefixMessages.length > 0) {
-		let historyText = previousSummary ?? "No prior history.";
+		let historyText = previousSummary === undefined ? "No prior history." : stripLegacyFileInventory(previousSummary);
 		let historyUsage: Usage | undefined;
 		if (messagesToSummarize.length > 0) {
 			const historyResult = await generateSummaryWithUsage(
@@ -1039,10 +971,6 @@ export async function compact(
 		summaryUsage = result.usage;
 	}
 
-	// Compute file lists and append to summary
-	const { readFiles, modifiedFiles } = computeFileLists(fileOps);
-	summary += formatFileOperations(readFiles, modifiedFiles);
-
 	if (!firstKeptEntryId) {
 		throw new Error("First kept entry has no UUID - session may need migration");
 	}
@@ -1052,7 +980,6 @@ export async function compact(
 		firstKeptEntryId,
 		tokensBefore,
 		usage: summaryUsage,
-		details: { readFiles, modifiedFiles } as CompactionDetails,
 	};
 }
 

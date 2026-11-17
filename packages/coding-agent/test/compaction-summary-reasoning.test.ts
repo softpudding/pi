@@ -135,8 +135,7 @@ describe("generateSummary reasoning options", () => {
 			turnPrefixMessages: messages,
 			isSplitTurn: true,
 			tokensBefore: 100,
-			previousSummary: "previous checkpoint",
-			fileOps: { read: new Set(), written: new Set(), edited: new Set() },
+			previousSummary: "previous checkpoint\n\n<modified-files>\nold.ts\n</modified-files>",
 			settings: { enabled: true, reserveTokens: 2000, keepRecentTokens: 20 },
 		};
 
@@ -144,6 +143,7 @@ describe("generateSummary reasoning options", () => {
 
 		expect(completeSimpleMock).toHaveBeenCalledTimes(1);
 		expect(result.summary).toContain("previous checkpoint");
+		expect(result.summary).not.toContain("old.ts");
 		const requestContext = completeSimpleMock.mock.calls[0][1] as TranscriptContext;
 		const prompt = JSON.stringify(requestContext.messages);
 		// Regression test for #9652: clear boundaries and continuation wording avoid the reasoning-extraction false positive.
@@ -160,7 +160,6 @@ describe("generateSummary reasoning options", () => {
 			isSplitTurn: true,
 			tokensBefore: 100,
 			previousSummary: "previous checkpoint",
-			fileOps: { read: new Set(), written: new Set(), edited: new Set() },
 			settings: { enabled: true, reserveTokens: 2000, keepRecentTokens: 20 },
 		};
 
@@ -187,7 +186,6 @@ describe("generateSummary reasoning options", () => {
 			turnPrefixMessages: messages,
 			isSplitTurn: true,
 			tokensBefore: 100,
-			fileOps: { read: new Set(), written: new Set(), edited: new Set() },
 			settings: { enabled: true, reserveTokens: 2000, keepRecentTokens: 20 },
 		};
 
@@ -220,7 +218,6 @@ describe("generateSummary reasoning options", () => {
 			turnPrefixMessages: messages,
 			isSplitTurn: true,
 			tokensBefore: 100,
-			fileOps: { read: new Set(), written: new Set(), edited: new Set() },
 			settings: { enabled: true, reserveTokens: 2000, keepRecentTokens: 20 },
 		};
 
@@ -303,7 +300,6 @@ describe("generateSummary reasoning options", () => {
 			turnPrefixMessages: messages,
 			isSplitTurn: true,
 			tokensBefore: 600000,
-			fileOps: { read: new Set(), written: new Set(), edited: new Set() },
 			settings: { enabled: true, reserveTokens: 16384, keepRecentTokens: 20000 },
 		};
 

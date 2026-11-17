@@ -5,7 +5,7 @@ This reference describes automatic compaction, branch summarization, persisted e
 **Source files** ([pi](https://github.com/earendil-works/pi)):
 - [`packages/coding-agent/src/core/compaction/compaction.ts`](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/src/core/compaction/compaction.ts) - Auto-compaction logic
 - [`packages/coding-agent/src/core/compaction/branch-summarization.ts`](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/src/core/compaction/branch-summarization.ts) - Branch summarization
-- [`packages/coding-agent/src/core/compaction/utils.ts`](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/src/core/compaction/utils.ts) - Shared utilities (file tracking, serialization)
+- [`packages/coding-agent/src/core/compaction/utils.ts`](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/src/core/compaction/utils.ts) - Shared utilities (legacy summary cleanup, serialization)
 - [`packages/coding-agent/src/core/session-manager.ts`](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/src/core/session-manager.ts) - Entry types (`CompactionEntry`, `BranchSummaryEntry`)
 - [`packages/coding-agent/src/core/extensions/types.ts`](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/src/core/extensions/types.ts) - Extension event types
 
@@ -20,7 +20,7 @@ Pi has two summarization mechanisms:
 | Compaction | Context exceeds threshold, or `/compact` | Summarize old messages to free up context |
 | Branch summarization | `/tree` navigation | Preserve context when switching branches |
 
-Both use closely related structured formats and track file operations cumulatively. Summarization requests disable prompt-cache writes because these one-off prompts are unlikely to be reused.
+Both use closely related structured formats. Summaries retain active constraints, unresolved work, consequential decisions, and references needed to resume; updates replace superseded state and remove redundant or no-longer-relevant history. Summarization requests disable prompt-cache writes because these one-off prompts are unlikely to be reused.
 
 ## Compaction
 
@@ -155,14 +155,9 @@ interface CompactionEntry<T = unknown> {
   details?: T;         // implementation-specific data
 }
 
-// Default compaction uses this for details (from compaction.ts):
-interface CompactionDetails {
-  readFiles: string[];
-  modifiedFiles: string[];
-}
 ```
 
-Extensions can store any JSON-serializable data in `details`. The default compaction tracks file operations, but custom extension implementations can use their own structure. Generated and extension-provided summaries store their LLM `usage` when available so session totals include summarization work.
+Extensions can store any JSON-serializable data in `details`. Default compaction does not populate `details`. Generated and extension-provided summaries store their LLM `usage` when available so session totals include summarization work.
 
 See [`prepareCompaction()`](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/src/core/compaction/compaction.ts) and [`compact()`](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/src/core/compaction/compaction.ts) for the implementation. For direct programmatic summarization, `generateSummary()` returns the summary text and `generateSummaryWithUsage()` returns `{ text, usage }`.
 
@@ -197,11 +192,11 @@ After navigation with summary:
          └─ E ─ F ─ [summary of B,C,D] (new leaf)
 ```
 
-### Cumulative File Tracking
+### File References and Legacy Summaries
 
-Default compaction and branch summarization track files cumulatively. Both extract file operations from tool calls in the messages being summarized. Compaction also carries file lists from the previous Pi-generated compaction. Branch summarization carries file lists from Pi-generated branch summaries in the entries it summarizes.
+Default compaction and branch summarization do not collect or inherit file-operation inventories. The summary may retain specific file paths needed to continue the work; raw tool calls remain in session history.
 
-File tracking therefore accumulates across default compactions and nested default branch summaries. Pi does not automatically carry file lists from extension-generated summaries whose `fromHook` field is `true`; extensions manage their own `details` format.
+Standalone `<read-files>` and `<modified-files>` blocks appended by older versions are removed when summaries become context messages and before a previous summary is reused for compaction, including split turns. This does not rewrite stored session entries or remove ordinary file references in summary prose. Old inventory metadata is no longer accumulated. Extensions still manage their own `details` format.
 
 ### BranchSummaryEntry Structure
 
@@ -220,11 +215,6 @@ interface BranchSummaryEntry<T = unknown> {
   details?: T;         // implementation-specific data
 }
 
-// Default branch summarization uses this for details (from branch-summarization.ts):
-interface BranchSummaryDetails {
-  readFiles: string[];
-  modifiedFiles: string[];
-}
 ```
 
 Same as compaction, extensions can store custom data in `details`.
@@ -233,7 +223,7 @@ See [`collectEntriesForBranchSummary()`](https://github.com/earendil-works/pi/bl
 
 ## Summary Format
 
-Both formats include Goal, Constraints & Preferences, Progress, Key Decisions, and Next Steps. Compaction summaries also include Critical Context. Branch summaries stop after Next Steps. Pi appends file lists to either format when relevant.
+Both formats include Goal, Constraints & Preferences, Progress, Key Decisions, and Next Steps. Compaction summaries also include Critical Context. Branch summaries stop after Next Steps.
 
 Compaction summaries use this format:
 
@@ -263,14 +253,6 @@ Compaction summaries use this format:
 ## Critical Context
 - [Data needed to continue]
 
-<read-files>
-path/to/file1.ts
-path/to/file2.ts
-</read-files>
-
-<modified-files>
-path/to/changed.ts
-</modified-files>
 ```
 
 ### Message Serialization
@@ -305,7 +287,6 @@ pi.on("session_before_compact", async (event, ctx) => {
   // preparation.messagesToSummarize - messages to summarize
   // preparation.turnPrefixMessages - user-message-span prefix (if isSplitTurn)
   // preparation.previousSummary - previous compaction summary
-  // preparation.fileOps - extracted file operations
   // preparation.tokensBefore - context tokens before compaction
   // preparation.firstKeptEntryId - where kept messages start
   // preparation.settings - effective settings after applying model overrides

@@ -7,6 +7,7 @@
 
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type { ImageContent, Message, TextContent } from "@earendil-works/pi-ai";
+import { stripLegacyFileInventory } from "./compaction/utils.ts";
 
 export const COMPACTION_SUMMARY_PREFIX = `The conversation history before this point was compacted into the following summary:
 
@@ -100,7 +101,7 @@ export function bashExecutionToText(msg: BashExecutionMessage): string {
 export function createBranchSummaryMessage(summary: string, fromId: string, timestamp: string): BranchSummaryMessage {
 	return {
 		role: "branchSummary",
-		summary,
+		summary: stripLegacyFileInventory(summary),
 		fromId,
 		timestamp: new Date(timestamp).getTime(),
 	};
@@ -113,7 +114,7 @@ export function createCompactionSummaryMessage(
 ): CompactionSummaryMessage {
 	return {
 		role: "compactionSummary",
-		summary: summary,
+		summary: stripLegacyFileInventory(summary),
 		tokensBefore,
 		timestamp: new Date(timestamp).getTime(),
 	};
